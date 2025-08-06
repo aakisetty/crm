@@ -37,11 +37,11 @@
    
    # OpenAI API Configuration
    # Get your API key from: https://platform.openai.com/api-keys
-   OPENAI_API_KEY=sk-proj-your-actual-openai-api-key-here
+   OPENAI_API_KEY=your-openai-api-key-here
    
    # Real Estate API Configuration  
    # Get your API key from: https://developer.realestateapi.com/
-   REAL_ESTATE_API_KEY=your-actual-real-estate-api-key-here
+   REAL_ESTATE_API_KEY=your-real-estate-api-key-here
    ```
 
 ## Required API Keys
