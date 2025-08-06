@@ -67,7 +67,7 @@ chainlit.md
 # API Keys and Sensitive Data (CRITICAL PROTECTION)
 **/api_keys.*
 **/secrets.*
-**/*key*
+**/*.key
 **/*secret*
 **/config.local.*
 test_result.md
