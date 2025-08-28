@@ -26,7 +26,11 @@ import {
   Loader2,
   AlertCircle,
   RefreshCw,
-  SlidersHorizontal
+  SlidersHorizontal,
+  X,
+  ChevronLeft,
+  ChevronRight,
+  Image
 } from 'lucide-react'
 
 // Debounce hook for search optimization
@@ -54,7 +58,9 @@ export function PropertySearch() {
     min_price: '',
     max_price: '',
     property_type: '',
-    sort_by: 'price_asc'
+    sort_by: 'price_asc',
+    limit: 60,
+    offset: 0
   })
   
   const [properties, setProperties] = useState([])
@@ -65,16 +71,28 @@ export function PropertySearch() {
   const [showFilters, setShowFilters] = useState(true)
   const [searchPerformed, setSearchPerformed] = useState(false)
 
+  // Gallery state
+  const [galleryOpen, setGalleryOpen] = useState(false)
+  const [galleryImages, setGalleryImages] = useState([])
+  const [galleryIndex, setGalleryIndex] = useState(0)
+  const [galleryTitle, setGalleryTitle] = useState('')
+
   // Debounced search for better UX
   const debouncedFilters = useDebounce(filters, 500)
 
   const formatCurrency = (amount) => {
-    if (!amount) return 'N/A'
+    if (amount === undefined || amount === null) return 'N/A'
+    let num = amount
+    if (typeof num === 'string') {
+      const cleaned = num.replace(/[^0-9.-]/g, '')
+      num = cleaned ? Number(cleaned) : NaN
+    }
+    if (typeof num !== 'number' || Number.isNaN(num)) return 'N/A'
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
       minimumFractionDigits: 0,
-    }).format(amount)
+    }).format(num)
   }
 
   const formatNumber = (num) => {
@@ -119,7 +137,8 @@ export function PropertySearch() {
           setProperties(prev => [...prev, ...data.properties])
         }
         setTotalResults(data.total)
-        setHasMore(data.has_more)
+        const pageSize = Number(searchFilters.limit) || 60
+        setHasMore(Boolean(data.has_more ?? (Array.isArray(data.properties) && data.properties.length >= pageSize)))
         setSearchPerformed(true)
       } else {
         throw new Error(data.error || 'Search failed')
@@ -144,15 +163,46 @@ export function PropertySearch() {
     }
   }, [debouncedFilters, performSearch, searchPerformed])
 
+  // Keyboard navigation for gallery
+  useEffect(() => {
+    if (!galleryOpen) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') setGalleryOpen(false)
+      if (e.key === 'ArrowRight') setGalleryIndex((i) => (i + 1) % Math.max(1, galleryImages.length))
+      if (e.key === 'ArrowLeft') setGalleryIndex((i) => (i - 1 + Math.max(1, galleryImages.length)) % Math.max(1, galleryImages.length))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [galleryOpen, galleryImages.length])
+
+  const openGallery = (property, startIndex = 0) => {
+    const imgs = Array.isArray(property.images) && property.images.length > 0
+      ? property.images
+      : (property.primary_image ? [property.primary_image] : [])
+    setGalleryImages(imgs)
+    setGalleryIndex(Math.min(Math.max(0, startIndex), Math.max(0, imgs.length - 1)))
+    const title = typeof property.address === 'object'
+      ? (property.address.street || property.address.address || '')
+      : property.address
+    setGalleryTitle(title)
+    setGalleryOpen(true)
+  }
+
   const handleManualSearch = () => {
+    // reset pagination on new manual search
+    setFilters(prev => ({ ...prev, offset: 0 }))
     setSearchPerformed(true)
-    performSearch(filters, true)
+    performSearch({ ...filters, offset: 0 }, true)
   }
 
   const handleFilterChange = (key, value) => {
+    // Treat the special 'any' option as an unset filter
+    const normalized = value === 'any' ? '' : value
     setFilters(prev => ({
       ...prev,
-      [key]: value
+      [key]: normalized,
+      // reset pagination when any filter changes
+      offset: 0
     }))
   }
 
@@ -164,7 +214,9 @@ export function PropertySearch() {
       min_price: '',
       max_price: '',
       property_type: '',
-      sort_by: 'price_asc'
+      sort_by: 'price_asc',
+      limit: 60,
+      offset: 0
     })
     setProperties([])
     setTotalResults(0)
@@ -172,93 +224,135 @@ export function PropertySearch() {
     setError(null)
   }
 
-  const PropertyCard = ({ property }) => (
-    <Card className="hover:shadow-lg transition-shadow cursor-pointer">
-      <CardContent className="p-6">
-        <div className="flex justify-between items-start mb-4">
-          <div className="flex-1">
-            <h3 className="text-lg font-semibold mb-1">{property.address}</h3>
-            <div className="flex items-center text-muted-foreground text-sm mb-2">
-              <MapPin className="h-4 w-4 mr-1" />
-              {property.city}, {property.state} {property.zipcode}
-            </div>
-            <div className="flex items-center gap-4 text-sm">
-              {property.bedrooms && (
-                <div className="flex items-center">
-                  <Bed className="h-4 w-4 mr-1" />
-                  {property.bedrooms} bed
-                </div>
-              )}
-              {property.bathrooms && (
-                <div className="flex items-center">
-                  <Bath className="h-4 w-4 mr-1" />
-                  {property.bathrooms} bath
-                </div>
-              )}
-              {property.square_feet && (
-                <div className="flex items-center">
-                  <Square className="h-4 w-4 mr-1" />
-                  {formatNumber(property.square_feet)} sq ft
-                </div>
-              )}
-            </div>
+  const PropertyCard = ({ property }) => {
+    // Prefer backend-provided primary_image, but fall back to the first valid URL in images
+    const firstImage = Array.isArray(property?.images)
+      ? property.images.find(u => typeof u === 'string' && /^https?:\/\//i.test(u))
+      : null
+    const thumb = property?.primary_image || firstImage
+
+    return (
+      <Card className="hover:shadow-lg transition-shadow">
+        <CardContent className="p-0">
+          {/* Thumbnail */}
+          <div className="relative w-full h-48 bg-muted overflow-hidden rounded-t" onClick={() => openGallery(property)}>
+            {thumb ? (
+              <img src={thumb} alt="Property thumbnail" className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                <Home className="h-8 w-8 mr-2" />
+                <span>No image</span>
+              </div>
+            )}
+            {(Array.isArray(property.images) && property.images.length > 0) && (
+              <div className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded flex items-center gap-1">
+                <Image className="h-3 w-3" /> {property.images.length}
+              </div>
+            )}
           </div>
-          <div className="text-right">
-            <p className="text-2xl font-bold text-primary mb-1">
-              {formatCurrency(property.price)}
-            </p>
-            {property.days_on_market && (
-              <p className="text-sm text-muted-foreground">
-                {property.days_on_market} days on market
+          <div className="p-6">
+            <div className="flex justify-between items-start mb-4">
+              <div className="flex-1">
+                <h3 className="text-lg font-semibold mb-1">
+                  {typeof property.address === 'object'
+                    ? (property.address.street || property.address.address || '')
+                    : property.address}
+                </h3>
+                <div className="flex items-center text-muted-foreground text-sm mb-2">
+                  <MapPin className="h-4 w-4 mr-1" />
+                  {property.city}, {property.state} {property.zipcode}
+                </div>
+                <div className="flex items-center gap-4 text-sm">
+                  {property.bedrooms && (
+                    <div className="flex items-center">
+                      <Bed className="h-4 w-4 mr-1" />
+                      {property.bedrooms} bed
+                    </div>
+                  )}
+                  {property.bathrooms && (
+                    <div className="flex items-center">
+                      <Bath className="h-4 w-4 mr-1" />
+                      {property.bathrooms} bath
+                    </div>
+                  )}
+                  {property.square_feet && (
+                    <div className="flex items-center">
+                      <Square className="h-4 w-4 mr-1" />
+                      {formatNumber(property.square_feet)} sq ft
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="text-right">
+                <p className="text-2xl font-bold text-primary mb-1">
+                  {formatCurrency(property.price)}
+                </p>
+                {property.days_on_market && (
+                  <p className="text-sm text-muted-foreground">
+                    {property.days_on_market} days on market
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {property.description && (
+              <p className="text-sm text-muted-foreground mb-4 line-clamp-2">
+                {property.description}
               </p>
             )}
-          </div>
-        </div>
 
-        {property.description && (
-          <p className="text-sm text-muted-foreground mb-4 line-clamp-2">
-            {property.description}
-          </p>
-        )}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                <Badge variant="outline">{property.property_type}</Badge>
+                {property.year_built && (
+                  <div className="flex items-center">
+                    <Calendar className="h-4 w-4 mr-1" />
+                    Built {property.year_built}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                {property.garage > 0 && (
+                  <div className="flex items-center">
+                    <Car className="h-4 w-4 mr-1" />
+                    {property.garage}
+                  </div>
+                )}
+                {property.pool && (
+                  <div className="flex items-center">
+                    <Droplets className="h-4 w-4" title="Pool" />
+                  </div>
+                )}
+                {property.fireplace && (
+                  <div className="flex items-center">
+                    <Flame className="h-4 w-4" title="Fireplace" />
+                  </div>
+                )}
+              </div>
+            </div>
 
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4 text-sm text-muted-foreground">
-            <Badge variant="outline">{property.property_type}</Badge>
-            {property.year_built && (
-              <div className="flex items-center">
-                <Calendar className="h-4 w-4 mr-1" />
-                Built {property.year_built}
+            {property.mls_number && (
+              <div className="mt-3 pt-3 border-t">
+                <p className="text-xs text-muted-foreground">MLS: {property.mls_number}</p>
               </div>
             )}
           </div>
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            {property.garage > 0 && (
-              <div className="flex items-center">
-                <Car className="h-4 w-4 mr-1" />
-                {property.garage}
-              </div>
-            )}
-            {property.pool && (
-              <div className="flex items-center">
-                <Droplets className="h-4 w-4" title="Pool" />
-              </div>
-            )}
-            {property.fireplace && (
-              <div className="flex items-center">
-                <Flame className="h-4 w-4" title="Fireplace" />
-              </div>
-            )}
+          <div className="pt-4">
+            <Button variant="outline" size="sm" onClick={() => openGallery(property)}>
+              View Photos
+            </Button>
           </div>
-        </div>
+        </CardContent>
+      </Card>
+    )
+  }
 
-        {property.mls_number && (
-          <div className="mt-3 pt-3 border-t">
-            <p className="text-xs text-muted-foreground">MLS: {property.mls_number}</p>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
+  const handleLoadMore = () => {
+    const nextOffset = properties.length
+    // persist offset into filters state for consistency
+    setFilters(prev => ({ ...prev, offset: nextOffset }))
+    performSearch({ ...filters, offset: nextOffset }, false)
+  }
 
   return (
     <div className="space-y-6">
@@ -303,12 +397,12 @@ export function PropertySearch() {
               {/* Bedrooms */}
               <div className="space-y-2">
                 <Label htmlFor="beds">Bedrooms</Label>
-                <Select value={filters.beds} onValueChange={(value) => handleFilterChange('beds', value)}>
+                <Select value={filters.beds || 'any'} onValueChange={(value) => handleFilterChange('beds', value)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Any" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">Any</SelectItem>
+                    <SelectItem value="any">Any</SelectItem>
                     <SelectItem value="1">1+</SelectItem>
                     <SelectItem value="2">2+</SelectItem>
                     <SelectItem value="3">3+</SelectItem>
@@ -321,12 +415,12 @@ export function PropertySearch() {
               {/* Bathrooms */}
               <div className="space-y-2">
                 <Label htmlFor="baths">Bathrooms</Label>
-                <Select value={filters.baths} onValueChange={(value) => handleFilterChange('baths', value)}>
+                <Select value={filters.baths || 'any'} onValueChange={(value) => handleFilterChange('baths', value)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Any" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">Any</SelectItem>
+                    <SelectItem value="any">Any</SelectItem>
                     <SelectItem value="1">1+</SelectItem>
                     <SelectItem value="1.5">1.5+</SelectItem>
                     <SelectItem value="2">2+</SelectItem>
@@ -364,12 +458,12 @@ export function PropertySearch() {
               {/* Property Type */}
               <div className="space-y-2">
                 <Label htmlFor="property_type">Property Type</Label>
-                <Select value={filters.property_type} onValueChange={(value) => handleFilterChange('property_type', value)}>
+                <Select value={filters.property_type || 'any'} onValueChange={(value) => handleFilterChange('property_type', value)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Any" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">Any</SelectItem>
+                    <SelectItem value="any">Any</SelectItem>
                     <SelectItem value="Single Family">Single Family</SelectItem>
                     <SelectItem value="Condo">Condo</SelectItem>
                     <SelectItem value="Townhouse">Townhouse</SelectItem>
@@ -485,7 +579,7 @@ export function PropertySearch() {
 
             {!loading && !error && properties.length > 0 && (
               <div className="space-y-4">
-                <div className="grid gap-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {properties.map((property, index) => (
                     <PropertyCard key={property.id || index} property={property} />
                   ))}
@@ -495,7 +589,7 @@ export function PropertySearch() {
                   <div className="text-center pt-4">
                     <Button
                       variant="outline"
-                      onClick={() => performSearch({...filters, offset: properties.length}, false)}
+                      onClick={handleLoadMore}
                       disabled={loading}
                     >
                       Load More Properties
@@ -522,6 +616,74 @@ export function PropertySearch() {
             </Button>
           </CardContent>
         </Card>
+      )}
+      {/* Gallery Modal */}
+      {galleryOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/70" onClick={() => setGalleryOpen(false)} />
+          <div className="relative z-10 w-full max-w-5xl mx-4">
+            <div className="bg-background rounded shadow-lg overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-3 border-b">
+                <div className="font-semibold truncate pr-4">{galleryTitle}</div>
+                <Button variant="ghost" size="icon" onClick={() => setGalleryOpen(false)}>
+                  <X className="h-5 w-5" />
+                </Button>
+              </div>
+              <div className="relative bg-black flex items-center justify-center" style={{minHeight: '60vh'}}>
+                {galleryImages.length > 0 ? (
+                  <img
+                    src={galleryImages[galleryIndex]}
+                    alt={`Photo ${galleryIndex + 1}`}
+                    className="max-h-[75vh] w-auto object-contain"
+                  />
+                ) : (
+                  <div className="text-muted-foreground py-24">No photos</div>
+                )}
+                {galleryImages.length > 1 && (
+                  <>
+                    <button
+                      className="absolute left-2 md:left-4 top-1/2 -translate-y-1/2 bg-black/50 text-white p-2 rounded-full"
+                      onClick={() => setGalleryIndex((i) => (i - 1 + galleryImages.length) % galleryImages.length)}
+                      aria-label="Previous"
+                    >
+                      <ChevronLeft className="h-5 w-5" />
+                    </button>
+                    <button
+                      className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 bg-black/50 text-white p-2 rounded-full"
+                      onClick={() => setGalleryIndex((i) => (i + 1) % galleryImages.length)}
+                      aria-label="Next"
+                    >
+                      <ChevronRight className="h-5 w-5" />
+                    </button>
+                  </>
+                )}
+                {galleryImages.length > 0 && (
+                  <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-white text-xs bg-black/50 px-2 py-1 rounded">
+                    {galleryIndex + 1} / {galleryImages.length}
+                  </div>
+                )}
+              </div>
+              {galleryImages.length > 1 && (
+                <div className="p-3 border-t">
+                  <ScrollArea className="w-full whitespace-nowrap">
+                    <div className="flex gap-2">
+                      {galleryImages.map((u, i) => (
+                        <button
+                          key={u + i}
+                          className={`relative h-16 w-24 overflow-hidden rounded border ${i === galleryIndex ? 'ring-2 ring-primary' : ''}`}
+                          onClick={() => setGalleryIndex(i)}
+                          aria-label={`Thumbnail ${i + 1}`}
+                        >
+                          <img src={u} alt={`Thumb ${i + 1}`} className="h-full w-full object-cover" />
+                        </button>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

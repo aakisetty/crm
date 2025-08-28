@@ -34,32 +34,69 @@ import {
   ChevronDown
 } from 'lucide-react'
 
-const STAGE_CONFIG = {
-  pre_listing: {
-    name: 'Pre-Listing',
-    description: 'Property preparation and market analysis',
-    color: 'bg-blue-500',
-    icon: FileText
+// Stage configurations for seller (sale) and buyer (purchase) transactions
+const STAGE_CONFIGS = {
+  sale: {
+    pre_listing: {
+      name: 'Pre-Listing',
+      description: 'Property preparation and market analysis',
+      color: 'bg-blue-500',
+      icon: FileText
+    },
+    listing: {
+      name: 'Active Listing',
+      description: 'Marketing and showing the property',
+      color: 'bg-yellow-500',
+      icon: PlayCircle
+    },
+    under_contract: {
+      name: 'Under Contract',
+      description: 'Inspections and closing preparations',
+      color: 'bg-orange-500',
+      icon: Clock
+    },
+    escrow_closing: {
+      name: 'Escrow & Closing',
+      description: 'Final steps and transaction completion',
+      color: 'bg-green-500',
+      icon: CheckCircle
+    }
   },
-  listing: {
-    name: 'Active Listing',
-    description: 'Marketing and showing the property',
-    color: 'bg-yellow-500',
-    icon: PlayCircle
-  },
-  under_contract: {
-    name: 'Under Contract',
-    description: 'Inspections and closing preparations',
-    color: 'bg-orange-500',
-    icon: Clock
-  },
-  escrow_closing: {
-    name: 'Escrow & Closing',
-    description: 'Final steps and transaction completion',
-    color: 'bg-green-500',
-    icon: CheckCircle
+  purchase: {
+    pre_approval: {
+      name: 'Pre-Approval',
+      description: 'Get pre-approved and define budget',
+      color: 'bg-blue-500',
+      icon: FileText
+    },
+    home_search: {
+      name: 'Home Search',
+      description: 'Tour properties and shortlist favorites',
+      color: 'bg-purple-500',
+      icon: PlayCircle
+    },
+    offer: {
+      name: 'Offer',
+      description: 'Prepare and submit purchase offer',
+      color: 'bg-yellow-500',
+      icon: FileText
+    },
+    under_contract: {
+      name: 'Under Contract',
+      description: 'Inspections, appraisal, and financing',
+      color: 'bg-orange-500',
+      icon: Clock
+    },
+    escrow_closing: {
+      name: 'Escrow & Closing',
+      description: 'Final steps and transaction completion',
+      color: 'bg-green-500',
+      icon: CheckCircle
+    }
   }
 }
+
+const firstStageForType = (type = 'sale') => Object.keys(STAGE_CONFIGS[type] || STAGE_CONFIGS.sale)[0]
 
 const STATUS_CONFIG = {
   not_started: { label: 'Not Started', color: 'bg-gray-500', icon: Circle },
@@ -78,14 +115,15 @@ const PRIORITY_CONFIG = {
 export function TransactionTimeline({ transactionId }) {
   const [transaction, setTransaction] = useState(null)
   const [checklistItems, setChecklistItems] = useState([])
-  const [activeStage, setActiveStage] = useState('pre_listing')
-  const [expandedStages, setExpandedStages] = useState({'pre_listing': true})
+  const [activeStage, setActiveStage] = useState(firstStageForType('sale'))
+  const [expandedStages, setExpandedStages] = useState({ [firstStageForType('sale')]: true })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [editingItem, setEditingItem] = useState(null)
   const [isAddingTask, setIsAddingTask] = useState(false)
   const [addTaskStage, setAddTaskStage] = useState('')
   const [transitionDialog, setTransitionDialog] = useState({ open: false, targetStage: null })
+  const [editForm, setEditForm] = useState(null)
 
   const [newTask, setNewTask] = useState({
     title: '',
@@ -93,7 +131,9 @@ export function TransactionTimeline({ transactionId }) {
     priority: 'medium',
     assignee: '',
     due_date: '',
-    notes: ''
+    notes: '',
+    weight: 1,
+    parent_id: null
   })
 
   useEffect(() => {
@@ -103,13 +143,23 @@ export function TransactionTimeline({ transactionId }) {
     }
   }, [transactionId])
 
+  useEffect(() => {
+    if (editingItem) {
+      setEditForm({ ...editingItem })
+    } else {
+      setEditForm(null)
+    }
+  }, [editingItem])
+
   const fetchTransaction = async () => {
     try {
       const response = await fetch(`/api/transactions/${transactionId}`)
       const data = await response.json()
       if (data.success) {
         setTransaction(data.transaction)
-        setActiveStage(data.transaction.current_stage)
+        const nextActive = data.transaction.current_stage
+        setActiveStage(nextActive)
+        setExpandedStages({ [nextActive]: true })
       }
     } catch (error) {
       console.error('Error fetching transaction:', error)
@@ -173,7 +223,9 @@ export function TransactionTimeline({ transactionId }) {
           priority: 'medium',
           assignee: '',
           due_date: '',
-          notes: ''
+          notes: '',
+          weight: 1,
+          parent_id: null
         })
         setIsAddingTask(false)
       }
@@ -213,7 +265,8 @@ export function TransactionTimeline({ transactionId }) {
       const data = await response.json()
       
       if (data.success) {
-        setTransaction(data.transaction)
+        // Backend does not return the full updated transaction; update locally
+        setTransaction(prev => prev ? { ...prev, current_stage: targetStage } : prev)
         setActiveStage(targetStage)
         fetchChecklist() // Refresh to get new default tasks
         setTransitionDialog({ open: false, targetStage: null })
@@ -235,8 +288,45 @@ export function TransactionTimeline({ transactionId }) {
   const getStageProgress = (stage) => {
     const stageItems = checklistItems.filter(item => item.stage === stage)
     if (stageItems.length === 0) return 0
-    const completedItems = stageItems.filter(item => item.status === 'completed')
-    return Math.round((completedItems.length / stageItems.length) * 100)
+
+    // Build map of items by parent
+    const byParent = new Map()
+    stageItems.forEach(it => {
+      const pid = it.parent_id || null
+      if (!byParent.has(pid)) byParent.set(pid, [])
+      byParent.get(pid).push(it)
+    })
+
+    const parents = byParent.get(null) || []
+    let totalWeight = 0
+    let completedWeight = 0
+
+    parents.forEach(parent => {
+      const children = byParent.get(parent.id) || []
+      if (children.length > 0) {
+        children.forEach(ch => {
+          const w = Number(ch.weight) || 1
+          totalWeight += w
+          if (ch.status === 'completed') completedWeight += w
+        })
+      } else {
+        const w = Number(parent.weight) || 1
+        totalWeight += w
+        if (parent.status === 'completed') completedWeight += w
+      }
+    })
+
+    // Include orphaned children (if any) whose parent isn't present
+    stageItems.forEach(it => {
+      if (it.parent_id && !parents.find(p => p.id === it.parent_id)) {
+        const w = Number(it.weight) || 1
+        totalWeight += w
+        if (it.status === 'completed') completedWeight += w
+      }
+    })
+
+    if (totalWeight === 0) return 0
+    return Math.round((completedWeight / totalWeight) * 100)
   }
 
   const getStageStats = (stage) => {
@@ -255,7 +345,7 @@ export function TransactionTimeline({ transactionId }) {
   }
 
   const canTransitionToStage = (stage) => {
-    const stages = Object.keys(STAGE_CONFIG)
+    const stages = Object.keys(STAGE_CONFIGS[(transaction?.transaction_type || 'sale')])
     const currentIndex = stages.indexOf(activeStage)
     const targetIndex = stages.indexOf(stage)
     return targetIndex <= currentIndex + 1
@@ -273,12 +363,12 @@ export function TransactionTimeline({ transactionId }) {
     return new Date(date).toLocaleDateString()
   }
 
-  const TaskItem = ({ item }) => {
+  const TaskItem = ({ item, indent = 0, isChild = false }) => {
     const StatusIcon = STATUS_CONFIG[item.status]?.icon || Circle
     
     return (
-      <Card className="mb-3 hover:shadow-sm transition-shadow">
-        <CardContent className="p-4">
+      <Card className={`mb-3 hover:shadow-sm transition-shadow ${isChild ? 'bg-muted/30' : ''}`}>
+        <CardContent className={`p-4 ${isChild ? 'py-3' : ''}`}>
           <div className="flex items-start justify-between">
             <div className="flex items-start space-x-3 flex-1">
               <Button
@@ -292,18 +382,19 @@ export function TransactionTimeline({ transactionId }) {
                 <StatusIcon className={`h-5 w-5 ${STATUS_CONFIG[item.status]?.color?.replace('bg-', 'text-')}`} />
               </Button>
               
-              <div className="flex-1">
-                <h4 className={`font-medium ${item.status === 'completed' ? 'line-through text-muted-foreground' : ''}`}>
+              <div className="flex-1" style={{ paddingLeft: indent }}>
+                <h4 className={`font-medium ${isChild ? 'text-sm' : ''} ${item.status === 'completed' ? 'line-through text-muted-foreground' : ''}`}>
                   {item.title}
                 </h4>
                 {item.description && (
-                  <p className="text-sm text-muted-foreground mt-1">{item.description}</p>
+                  <p className={`text-sm text-muted-foreground mt-1 ${isChild ? 'text-xs' : ''}`}>{item.description}</p>
                 )}
                 
-                <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
+                <div className={`flex items-center gap-4 mt-2 text-sm text-muted-foreground ${isChild ? 'text-xs' : ''}`}>
                   <Badge variant="outline" className={PRIORITY_CONFIG[item.priority]?.color}>
                     {PRIORITY_CONFIG[item.priority]?.label}
                   </Badge>
+                  <Badge variant="outline">w: {Number(item.weight ?? 1)}</Badge>
                   
                   {item.assignee && (
                     <div className="flex items-center gap-1">
@@ -330,6 +421,20 @@ export function TransactionTimeline({ transactionId }) {
             </div>
             
             <div className="flex items-center gap-1">
+              {!item.parent_id && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setAddTaskStage(item.stage)
+                    setNewTask(nt => ({ ...nt, parent_id: item.id }))
+                    setIsAddingTask(true)
+                  }}
+                  title="Add subtask"
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
@@ -360,6 +465,9 @@ export function TransactionTimeline({ transactionId }) {
     </div>
   }
 
+  // Resolve stage config based on transaction type (defaults to seller flow until loaded)
+  const stageConfig = STAGE_CONFIGS[(transaction?.transaction_type || 'sale')]
+
   return (
     <div className="space-y-6">
       {/* Transaction Header */}
@@ -375,7 +483,7 @@ export function TransactionTimeline({ transactionId }) {
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-lg px-3 py-1">
-              {STAGE_CONFIG[activeStage]?.name}
+              {stageConfig[activeStage]?.name}
             </Badge>
           </div>
         </CardHeader>
@@ -389,7 +497,7 @@ export function TransactionTimeline({ transactionId }) {
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
-            {Object.entries(STAGE_CONFIG).map(([stageKey, stage], index) => {
+            {Object.entries(stageConfig).map(([stageKey, stage], index) => {
               const isActive = stageKey === activeStage
               const isCompleted = isStageCompleted(stageKey)
               const progress = getStageProgress(stageKey)
@@ -474,11 +582,25 @@ export function TransactionTimeline({ transactionId }) {
                         )}
                       </div>
 
-                      {/* Checklist Items */}
+                      {/* Checklist Items (parents with nested subtasks) */}
                       <div className="space-y-2">
-                        {stageItems.map(item => (
-                          <TaskItem key={item.id} item={item} />
-                        ))}
+                        {stageItems
+                          .filter(item => !item.parent_id)
+                          .map(parent => {
+                            const children = checklistItems.filter(c => c.parent_id === parent.id && c.stage === stageKey)
+                            return (
+                              <div key={parent.id}>
+                                <TaskItem item={parent} />
+                                {children.length > 0 && (
+                                  <div className="mt-2 ml-6 pl-4 space-y-2 border-l border-muted-foreground/20">
+                                    {children.map(child => (
+                                      <TaskItem key={child.id} item={child} indent={0} isChild={true} />
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
                       </div>
 
                       {/* Add Task Button */}
@@ -506,36 +628,36 @@ export function TransactionTimeline({ transactionId }) {
       <Dialog open={isAddingTask} onOpenChange={setIsAddingTask}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Add Task to {STAGE_CONFIG[addTaskStage]?.name}</DialogTitle>
+            <DialogTitle>Add Task to {stageConfig[addTaskStage]?.name}</DialogTitle>
             <DialogDescription>Create a new checklist item for this transaction stage</DialogDescription>
           </DialogHeader>
-          
+
           <div className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="task-title">Title</Label>
               <Input
                 id="task-title"
                 value={newTask.title}
-                onChange={(e) => setNewTask({...newTask, title: e.target.value})}
+                onChange={(e) => setNewTask({ ...newTask, title: e.target.value })}
                 placeholder="Task title"
               />
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="task-description">Description</Label>
               <Textarea
                 id="task-description"
                 value={newTask.description}
-                onChange={(e) => setNewTask({...newTask, description: e.target.value})}
+                onChange={(e) => setNewTask({ ...newTask, description: e.target.value })}
                 placeholder="Task description"
                 rows={3}
               />
             </div>
-            
+
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="task-priority">Priority</Label>
-                <Select value={newTask.priority} onValueChange={(value) => setNewTask({...newTask, priority: value})}>
+                <Select value={newTask.priority} onValueChange={(value) => setNewTask({ ...newTask, priority: value })}>
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
@@ -547,33 +669,223 @@ export function TransactionTimeline({ transactionId }) {
                   </SelectContent>
                 </Select>
               </div>
-              
+
               <div className="space-y-2">
                 <Label htmlFor="task-assignee">Assignee</Label>
                 <Input
                   id="task-assignee"
                   value={newTask.assignee}
-                  onChange={(e) => setNewTask({...newTask, assignee: e.target.value})}
+                  onChange={(e) => setNewTask({ ...newTask, assignee: e.target.value })}
                   placeholder="Assigned to"
                 />
               </div>
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="task-due-date">Due Date</Label>
               <Input
                 id="task-due-date"
                 type="date"
                 value={newTask.due_date}
-                onChange={(e) => setNewTask({...newTask, due_date: e.target.value})}
+                onChange={(e) => setNewTask({ ...newTask, due_date: e.target.value })}
               />
             </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="task-weight">Weight</Label>
+                <Input
+                  id="task-weight"
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={newTask.weight}
+                  onChange={(e) => setNewTask({ ...newTask, weight: Number(e.target.value) })}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="task-parent">Parent Task (optional)</Label>
+                <Select
+                  value={newTask.parent_id ?? '__none__'}
+                  onValueChange={(value) => setNewTask({ ...newTask, parent_id: value === '__none__' ? null : value })}
+                >
+                  <SelectTrigger id="task-parent">
+                    <SelectValue placeholder="None (Top-level)" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">None (Top-level)</SelectItem>
+                    {checklistItems
+                      .filter(i => i.stage === addTaskStage && !i.parent_id)
+                      .map(p => (
+                        <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="flex justify-end space-x-2 pt-4">
+              <Button variant="outline" onClick={() => setIsAddingTask(false)}>Cancel</Button>
+              <Button onClick={() => addChecklistItem(addTaskStage)} disabled={!newTask.title || loading}>
+                {loading ? 'Creating...' : 'Create Task'}
+              </Button>
+            </div>
           </div>
-          
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Task Dialog */}
+      <Dialog open={!!editingItem} onOpenChange={(open) => !open && setEditingItem(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Task</DialogTitle>
+            <DialogDescription>Update task details, weight, and parent</DialogDescription>
+          </DialogHeader>
+
+          {editForm && (
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="edit-title">Title</Label>
+                <Input
+                  id="edit-title"
+                  value={editForm.title || ''}
+                  onChange={(e) => setEditForm({ ...editForm, title: e.target.value })}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="edit-description">Description</Label>
+                <Textarea
+                  id="edit-description"
+                  rows={3}
+                  value={editForm.description || ''}
+                  onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-priority">Priority</Label>
+                  <Select value={editForm.priority || 'medium'} onValueChange={(value) => setEditForm({ ...editForm, priority: value })}>
+                    <SelectTrigger id="edit-priority">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="low">Low</SelectItem>
+                      <SelectItem value="medium">Medium</SelectItem>
+                      <SelectItem value="high">High</SelectItem>
+                      <SelectItem value="urgent">Urgent</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit-status">Status</Label>
+                  <Select value={editForm.status || 'not_started'} onValueChange={(value) => setEditForm({ ...editForm, status: value })}>
+                    <SelectTrigger id="edit-status">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="not_started">Not Started</SelectItem>
+                      <SelectItem value="in_progress">In Progress</SelectItem>
+                      <SelectItem value="completed">Completed</SelectItem>
+                      <SelectItem value="blocked">Blocked</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-assignee">Assignee</Label>
+                  <Input
+                    id="edit-assignee"
+                    value={editForm.assignee || ''}
+                    onChange={(e) => setEditForm({ ...editForm, assignee: e.target.value })}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit-due-date">Due Date</Label>
+                  <Input
+                    id="edit-due-date"
+                    type="date"
+                    value={editForm.due_date ? new Date(editForm.due_date).toISOString().slice(0,10) : ''}
+                    onChange={(e) => setEditForm({ ...editForm, due_date: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="edit-notes">Notes</Label>
+                <Textarea
+                  id="edit-notes"
+                  rows={3}
+                  value={editForm.notes || ''}
+                  onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-weight">Weight</Label>
+                  <Input
+                    id="edit-weight"
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    value={Number(editForm.weight ?? 1)}
+                    onChange={(e) => setEditForm({ ...editForm, weight: Number(e.target.value) })}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit-parent">Parent Task</Label>
+                  <Select
+                    value={editForm.parent_id ?? '__none__'}
+                    onValueChange={(value) => setEditForm({ ...editForm, parent_id: value === '__none__' ? null : value })}
+                  >
+                    <SelectTrigger id="edit-parent">
+                      <SelectValue placeholder="None (Top-level)" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">None (Top-level)</SelectItem>
+                      {checklistItems
+                        .filter(i => !i.parent_id && i.id !== editForm.id)
+                        .map(p => (
+                          <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="flex justify-end space-x-2 pt-4">
-            <Button variant="outline" onClick={() => setIsAddingTask(false)}>Cancel</Button>
-            <Button onClick={() => addChecklistItem(addTaskStage)} disabled={!newTask.title || loading}>
-              {loading ? 'Creating...' : 'Create Task'}
+            <Button variant="outline" onClick={() => setEditingItem(null)}>Cancel</Button>
+            <Button
+              onClick={async () => {
+                if (!editForm || !editingItem) return
+                const updates = {
+                  title: editForm.title || '',
+                  description: editForm.description || '',
+                  priority: editForm.priority || 'medium',
+                  assignee: editForm.assignee || '',
+                  due_date: editForm.due_date || '',
+                  notes: editForm.notes || '',
+                  status: editForm.status || 'not_started',
+                  weight: Number(editForm.weight) || 1,
+                  parent_id: editForm.parent_id || null
+                }
+                await updateChecklistItem(editingItem.id, updates)
+                await fetchChecklist()
+                setEditingItem(null)
+              }}
+              disabled={loading}
+            >
+              {loading ? 'Saving...' : 'Save Changes'}
             </Button>
           </div>
         </DialogContent>

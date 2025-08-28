@@ -9,16 +9,43 @@ import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Avatar, AvatarFallback, AvatarInitials } from '@/components/ui/avatar'
-import { Search, Plus, Users, TrendingUp, Home, Phone, Mail, MapPin, DollarSign, Building, Sparkles, Bot, MessageSquare, FileText } from 'lucide-react'
+import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { Search, Plus, Users, TrendingUp, Home, Phone, Mail, MapPin, DollarSign, Building, Sparkles, Bot, FileText, Trash2 } from 'lucide-react'
 import { Textarea } from '@/components/ui/textarea'
 import { AssistantChat } from '@/components/AssistantChat'
 import { PropertySearch } from '@/components/PropertySearch'
+import { AssistantPanel } from '@/components/AssistantPanel'
 import { TransactionManagement } from '@/components/TransactionManagement'
-import { DealCommand, SmartAlerts } from '@/components/DealSummary'
+import { SmartAlerts } from '@/components/DealSummary'
+import { MarkdownText } from '@/components/ui/markdown'
+import { 
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import {
+  SidebarProvider,
+  Sidebar,
+  SidebarContent,
+  SidebarHeader,
+  SidebarGroup,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuItem,
+  SidebarMenuButton,
+  SidebarSeparator,
+  SidebarInset,
+} from '@/components/ui/sidebar'
 
 export default function RealEstateCRM() {
-  const [activeTab, setActiveTab] = useState('dashboard')
+  // Default to Assistant tab on load
+  const [activeTab, setActiveTab] = useState('assistant')
   const [leads, setLeads] = useState([])
   const [filteredLeads, setFilteredLeads] = useState([])
   const [searchTerm, setSearchTerm] = useState('')
@@ -29,6 +56,18 @@ export default function RealEstateCRM() {
   const [dashboardStats, setDashboardStats] = useState({})
   const [loading, setLoading] = useState(false)
   const [propertyMatches, setPropertyMatches] = useState(null)
+  const [isStartTransDialogOpen, setIsStartTransDialogOpen] = useState(false)
+  const [transactionDraft, setTransactionDraft] = useState({
+    property_address: '',
+    client_name: '',
+    client_email: '',
+    client_phone: '',
+    transaction_type: 'sale',
+    assigned_agent: '',
+    listing_price: '',
+    closing_date: ''
+  })
+  const [transactionsRefresh, setTransactionsRefresh] = useState(0)
   const [newLead, setNewLead] = useState({
     name: '',
     email: '',
@@ -39,7 +78,21 @@ export default function RealEstateCRM() {
       min_price: '',
       max_price: '',
       bedrooms: '',
-      bathrooms: ''
+      bathrooms: '',
+      // seller-specific (optional)
+      seller_address: '',
+      seller_price: '',
+      seller_property_type: '',
+      seller_bedrooms: '',
+      seller_bathrooms: '',
+      seller_year_built: '',
+      seller_square_feet: '',
+      seller_lot_size: '',
+      seller_condition: '',
+      seller_occupancy: '',
+      seller_timeline: '',
+      seller_hoa_fee: '',
+      seller_description: ''
     },
     assigned_agent: '',
     tags: []
@@ -62,7 +115,9 @@ export default function RealEstateCRM() {
     try {
       const response = await fetch('/api/leads')
       const data = await response.json()
-      setLeads(data)
+      // Ensure we always store an array of leads
+      const arr = Array.isArray(data) ? data : (Array.isArray(data?.leads) ? data.leads : [])
+      setLeads(arr)
     } catch (error) {
       console.error('Error fetching leads:', error)
     }
@@ -79,21 +134,23 @@ export default function RealEstateCRM() {
   }
 
   const filterLeads = () => {
-    let filtered = leads
+    let filtered = Array.isArray(leads) ? leads : []
 
     if (searchTerm) {
-      filtered = filtered.filter(lead =>
-        lead.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        lead.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        lead.phone.includes(searchTerm)
-      )
+      const q = searchTerm.toLowerCase()
+      filtered = filtered.filter(lead => {
+        const name = (lead?.name || '').toLowerCase()
+        const email = (lead?.email || '').toLowerCase()
+        const phone = (lead?.phone || '')
+        return name.includes(q) || email.includes(q) || phone.includes(searchTerm)
+      })
     }
 
     if (filterType !== 'all') {
-      filtered = filtered.filter(lead => lead.lead_type === filterType)
+      filtered = filtered.filter(lead => lead?.lead_type === filterType)
     }
 
-    setFilteredLeads(filtered)
+    setFilteredLeads(Array.isArray(filtered) ? filtered : [])
   }
 
   const handleAddLead = async () => {
@@ -118,7 +175,20 @@ export default function RealEstateCRM() {
             min_price: '',
             max_price: '',
             bedrooms: '',
-            bathrooms: ''
+            bathrooms: '',
+            seller_address: '',
+            seller_price: '',
+            seller_property_type: '',
+            seller_bedrooms: '',
+            seller_bathrooms: '',
+            seller_year_built: '',
+            seller_square_feet: '',
+            seller_lot_size: '',
+            seller_condition: '',
+            seller_occupancy: '',
+            seller_timeline: '',
+            seller_hoa_fee: '',
+            seller_description: ''
           },
           assigned_agent: '',
           tags: []
@@ -132,6 +202,63 @@ export default function RealEstateCRM() {
     } catch (error) {
       console.error('Error adding lead:', error)
       alert('Error adding lead')
+    }
+    setLoading(false)
+  }
+
+  const openStartTransaction = (lead) => {
+    const isSeller = lead?.lead_type === 'seller'
+    setTransactionDraft({
+      property_address: isSeller ? (lead?.preferences?.seller_address || '') : '',
+      client_name: lead?.name || '',
+      client_email: lead?.email || '',
+      client_phone: lead?.phone || '',
+      transaction_type: isSeller ? 'sale' : 'purchase',
+      assigned_agent: lead?.assigned_agent || '',
+      listing_price: isSeller ? (lead?.preferences?.seller_price || '') : '',
+      closing_date: ''
+    })
+    setIsStartTransDialogOpen(true)
+  }
+
+  const createTransactionFromLead = async () => {
+    setLoading(true)
+    try {
+      const payload = { ...transactionDraft }
+      if (!payload.property_address) {
+        // Backend requires property_address; for buyer flows, use a sensible placeholder
+        if ((payload.transaction_type || 'purchase') === 'purchase') {
+          const name = (payload.client_name || '').trim()
+          payload.property_address = `Buyer prospect${name ? ` - ${name}` : ''}`
+        }
+      }
+
+      const response = await fetch('/api/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.ok && (data.success || data.transaction || data.id)) {
+        setIsStartTransDialogOpen(false)
+        setTransactionDraft({
+          property_address: '',
+          client_name: '',
+          client_email: '',
+          client_phone: '',
+          transaction_type: 'sale',
+          assigned_agent: '',
+          listing_price: '',
+          closing_date: ''
+        })
+        setTransactionsRefresh((prev) => prev + 1)
+        setActiveTab('transactions')
+      } else {
+        alert(data.error || 'Failed to create transaction')
+      }
+    } catch (error) {
+      console.error('Error creating transaction from lead:', error)
+      alert('Failed to create transaction')
     }
     setLoading(false)
   }
@@ -166,13 +293,40 @@ export default function RealEstateCRM() {
       })
       const data = await response.json()
       setPropertyMatches(data)
+      if (data?.updated_lead?.id) {
+        setLeads(prev => prev.map(l => l.id === data.updated_lead.id ? data.updated_lead : l))
+      }
     } catch (error) {
       console.error('Error finding property matches:', error)
     }
     setLoading(false)
   }
 
+  const handleDeleteLead = async (leadId) => {
+    if (!leadId) return
+    setLoading(true)
+    try {
+      const response = await fetch(`/api/leads/${leadId}`, { method: 'DELETE' })
+      if (response.ok) {
+        setLeads(prev => prev.filter(l => l.id !== leadId))
+        if (selectedLead?.id === leadId) {
+          setIsEditDialogOpen(false)
+          setSelectedLead(null)
+        }
+        fetchDashboardStats()
+      } else {
+        const err = await response.json().catch(() => ({}))
+        alert(err?.error || 'Failed to delete lead')
+      }
+    } catch (error) {
+      console.error('Error deleting lead:', error)
+      alert('Error deleting lead')
+    }
+    setLoading(false)
+  }
+
   const getInitials = (name) => {
+    if (!name || typeof name !== 'string') return 'NA'
     return name.split(' ').map(n => n[0]).join('').toUpperCase()
   }
 
@@ -185,54 +339,52 @@ export default function RealEstateCRM() {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      <div className="container mx-auto py-8 px-4">
-        <div className="flex flex-col space-y-8">
-          {/* Header */}
-          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-            <div>
-              <h1 className="text-4xl font-bold text-foreground">Real Estate CRM</h1>
-              <p className="text-muted-foreground">AI-powered lead management and property matching</p>
-            </div>
-            <div className="flex gap-2">
-              <Button 
-                onClick={() => setActiveTab('assistant')} 
-                variant={activeTab === 'assistant' ? 'default' : 'outline'}
-                className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white border-0"
-              >
-                <Bot className="mr-2 h-4 w-4" />
-                AI Assistant
-              </Button>
-              <Button onClick={() => setIsAddDialogOpen(true)} className="bg-primary hover:bg-primary/90">
-                <Plus className="mr-2 h-4 w-4" />
-                Add Lead
-              </Button>
-            </div>
-          </div>
-
-          {/* Main Tabs */}
+    <SidebarProvider>
+      <Sidebar collapsible="icon" className="bg-secondary">
+        <SidebarHeader />
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarGroupLabel>Overview</SidebarGroupLabel>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton isActive={activeTab === 'assistant'} onClick={() => setActiveTab('assistant')}>
+                  <Bot className="h-4 w-4" />
+                  <span>Assistant</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton isActive={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')}>
+                  <Users className="h-4 w-4" />
+                  <span>Leads</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton isActive={activeTab === 'transactions'} onClick={() => setActiveTab('transactions')}>
+                  <FileText className="h-4 w-4" />
+                  <span>Transactions</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton isActive={activeTab === 'properties'} onClick={() => setActiveTab('properties')}>
+                  <Home className="h-4 w-4" />
+                  <span>Properties</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroup>
+          <SidebarSeparator />
+        </SidebarContent>
+      </Sidebar>
+      <SidebarInset>
+        <div className="container mx-auto py-6 px-4">
+          <div className="flex flex-col space-y-6">
+          {/* Main Tabs (Sidebar controls the active tab; hide tab list visually) */}
           <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-            <TabsList className="grid w-full grid-cols-5">
-              <TabsTrigger value="dashboard" className="flex items-center gap-2">
-                <Users className="h-4 w-4" />
-                Leads
-              </TabsTrigger>
-              <TabsTrigger value="properties" className="flex items-center gap-2">
-                <Home className="h-4 w-4" />
-                Properties
-              </TabsTrigger>
-              <TabsTrigger value="transactions" className="flex items-center gap-2">
-                <FileText className="h-4 w-4" />
-                Transactions
-              </TabsTrigger>
-              <TabsTrigger value="commands" className="flex items-center gap-2">
-                <MessageSquare className="h-4 w-4" />
-                Commands
-              </TabsTrigger>
-              <TabsTrigger value="assistant" className="flex items-center gap-2">
-                <Bot className="h-4 w-4" />
-                Assistant
-              </TabsTrigger>
+            <TabsList className="hidden">
+              <TabsTrigger value="assistant" />
+              <TabsTrigger value="dashboard" />
+              <TabsTrigger value="transactions" />
+              <TabsTrigger value="properties" />
             </TabsList>
 
             {/* Dashboard Tab */}
@@ -371,6 +523,41 @@ export default function RealEstateCRM() {
                               <Sparkles className="mr-2 h-4 w-4" />
                               AI Match
                             </Button>
+                            <Button
+                              variant="default"
+                              size="sm"
+                              onClick={() => openStartTransaction(lead)}
+                            >
+                              <FileText className="mr-2 h-4 w-4" />
+                              Start Transaction
+                            </Button>
+                            <AlertDialog>
+                              <AlertDialogTrigger asChild>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="text-red-600 border-red-600 hover:bg-red-50"
+                                  disabled={loading}
+                                >
+                                  <Trash2 className="mr-2 h-4 w-4" />
+                                  Delete
+                                </Button>
+                              </AlertDialogTrigger>
+                              <AlertDialogContent>
+                                <AlertDialogHeader>
+                                  <AlertDialogTitle>Delete lead?</AlertDialogTitle>
+                                  <AlertDialogDescription>
+                                    This action cannot be undone. This will permanently remove {lead.name}'s lead and related insights.
+                                  </AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <AlertDialogFooter>
+                                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                  <AlertDialogAction onClick={() => handleDeleteLead(lead.id)}>
+                                    Delete
+                                  </AlertDialogAction>
+                                </AlertDialogFooter>
+                              </AlertDialogContent>
+                            </AlertDialog>
                           </div>
                         </div>
                       </div>
@@ -378,7 +565,7 @@ export default function RealEstateCRM() {
                       {lead.ai_insights && (
                         <div className="mt-4 p-3 bg-muted rounded-lg">
                           <p className="text-sm font-medium text-muted-foreground mb-1">AI Insights:</p>
-                          <p className="text-sm">{lead.ai_insights}</p>
+                          <MarkdownText text={lead.ai_insights} className="text-sm" />
                         </div>
                       )}
                     </CardContent>
@@ -412,16 +599,13 @@ export default function RealEstateCRM() {
               )}
             </TabsContent>
 
-            {/* Commands Tab */}
-            <TabsContent value="commands" className="space-y-6">
-              <DealCommand />
-            </TabsContent>
+          
 
             {/* Transactions Tab */}
             <TabsContent value="transactions" className="space-y-6">
               <div className="grid gap-6 lg:grid-cols-3">
                 <div className="lg:col-span-2">
-                  <TransactionManagement />
+                  <TransactionManagement key={transactionsRefresh} />
                 </div>
                 <div>
                   <Card>
@@ -443,6 +627,7 @@ export default function RealEstateCRM() {
 
             {/* Assistant Tab */}
             <TabsContent value="assistant" className="space-y-6">
+            <AssistantPanel />
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
@@ -476,7 +661,7 @@ export default function RealEstateCRM() {
           <Tabs defaultValue="basic" className="w-full">
             <TabsList className="grid w-full grid-cols-2">
               <TabsTrigger value="basic">Basic Info</TabsTrigger>
-              <TabsTrigger value="preferences">Preferences</TabsTrigger>
+              <TabsTrigger value="preferences">Details</TabsTrigger>
             </TabsList>
             <TabsContent value="basic" className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
@@ -534,75 +719,289 @@ export default function RealEstateCRM() {
               </div>
             </TabsContent>
             <TabsContent value="preferences" className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="zipcode">Preferred Zipcode</Label>
-                  <Input
-                    id="zipcode"
-                    value={newLead.preferences.zipcode}
-                    onChange={(e) => setNewLead({
-                      ...newLead,
-                      preferences: {...newLead.preferences, zipcode: e.target.value}
-                    })}
-                    placeholder="90210"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="bedrooms">Bedrooms</Label>
-                  <Input
-                    id="bedrooms"
-                    type="number"
-                    value={newLead.preferences.bedrooms}
-                    onChange={(e) => setNewLead({
-                      ...newLead,
-                      preferences: {...newLead.preferences, bedrooms: e.target.value}
-                    })}
-                    placeholder="3"
-                  />
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="min_price">Min Price</Label>
-                  <Input
-                    id="min_price"
-                    type="number"
-                    value={newLead.preferences.min_price}
-                    onChange={(e) => setNewLead({
-                      ...newLead,
-                      preferences: {...newLead.preferences, min_price: e.target.value}
-                    })}
-                    placeholder="300000"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="max_price">Max Price</Label>
-                  <Input
-                    id="max_price"
-                    type="number"
-                    value={newLead.preferences.max_price}
-                    onChange={(e) => setNewLead({
-                      ...newLead,
-                      preferences: {...newLead.preferences, max_price: e.target.value}
-                    })}
-                    placeholder="500000"
-                  />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="bathrooms">Bathrooms</Label>
-                <Input
-                  id="bathrooms"
-                  type="number"
-                  step="0.5"
-                  value={newLead.preferences.bathrooms}
-                  onChange={(e) => setNewLead({
-                    ...newLead,
-                    preferences: {...newLead.preferences, bathrooms: e.target.value}
-                  })}
-                  placeholder="2"
-                />
-              </div>
+              {newLead.lead_type === 'seller' ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="seller_address">Property Address</Label>
+                    <Input
+                      id="seller_address"
+                      value={newLead.preferences?.seller_address || ''}
+                      onChange={(e) => setNewLead({
+                        ...newLead,
+                        preferences: { ...newLead.preferences, seller_address: e.target.value }
+                      })}
+                      placeholder="123 Main St, City, State, ZIP"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="seller_price">Asking Price</Label>
+                    <Input
+                      id="seller_price"
+                      type="number"
+                      value={newLead.preferences?.seller_price || ''}
+                      onChange={(e) => setNewLead({
+                        ...newLead,
+                        preferences: { ...newLead.preferences, seller_price: e.target.value }
+                      })}
+                      placeholder="500000"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_property_type">Property Type</Label>
+                      <Select
+                        value={newLead.preferences?.seller_property_type || ''}
+                        onValueChange={(v) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_property_type: v }
+                        })}
+                      >
+                        <SelectTrigger id="seller_property_type">
+                          <SelectValue placeholder="Select type" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="single_family">Single Family</SelectItem>
+                          <SelectItem value="condo">Condo</SelectItem>
+                          <SelectItem value="townhouse">Townhouse</SelectItem>
+                          <SelectItem value="multi_family">Multi-Family</SelectItem>
+                          <SelectItem value="land">Land</SelectItem>
+                          <SelectItem value="other">Other</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="seller_bedrooms">Bedrooms</Label>
+                        <Input
+                          id="seller_bedrooms"
+                          type="number"
+                          value={newLead.preferences?.seller_bedrooms || ''}
+                          onChange={(e) => setNewLead({
+                            ...newLead,
+                            preferences: { ...newLead.preferences, seller_bedrooms: e.target.value }
+                          })}
+                          placeholder="3"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="seller_bathrooms">Bathrooms</Label>
+                        <Input
+                          id="seller_bathrooms"
+                          type="number"
+                          step="0.5"
+                          value={newLead.preferences?.seller_bathrooms || ''}
+                          onChange={(e) => setNewLead({
+                            ...newLead,
+                            preferences: { ...newLead.preferences, seller_bathrooms: e.target.value }
+                          })}
+                          placeholder="2"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_year_built">Year Built</Label>
+                      <Input
+                        id="seller_year_built"
+                        type="number"
+                        value={newLead.preferences?.seller_year_built || ''}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_year_built: e.target.value }
+                        })}
+                        placeholder="1998"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_square_feet">Square Feet</Label>
+                      <Input
+                        id="seller_square_feet"
+                        type="number"
+                        value={newLead.preferences?.seller_square_feet || ''}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_square_feet: e.target.value }
+                        })}
+                        placeholder="1800"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_lot_size">Lot Size (sq ft)</Label>
+                      <Input
+                        id="seller_lot_size"
+                        type="number"
+                        value={newLead.preferences?.seller_lot_size || ''}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_lot_size: e.target.value }
+                        })}
+                        placeholder="6500"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_condition">Condition</Label>
+                      <Select
+                        value={newLead.preferences?.seller_condition || ''}
+                        onValueChange={(v) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_condition: v }
+                        })}
+                      >
+                        <SelectTrigger id="seller_condition">
+                          <SelectValue placeholder="Select condition" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="needs_work">Needs work</SelectItem>
+                          <SelectItem value="average">Average</SelectItem>
+                          <SelectItem value="good">Good</SelectItem>
+                          <SelectItem value="excellent">Excellent</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_occupancy">Occupancy</Label>
+                      <Select
+                        value={newLead.preferences?.seller_occupancy || ''}
+                        onValueChange={(v) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_occupancy: v }
+                        })}
+                      >
+                        <SelectTrigger id="seller_occupancy">
+                          <SelectValue placeholder="Select occupancy" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="owner">Owner-occupied</SelectItem>
+                          <SelectItem value="tenant">Tenant-occupied</SelectItem>
+                          <SelectItem value="vacant">Vacant</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_timeline">Timeline to List</Label>
+                      <Select
+                        value={newLead.preferences?.seller_timeline || ''}
+                        onValueChange={(v) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_timeline: v }
+                        })}
+                      >
+                        <SelectTrigger id="seller_timeline">
+                          <SelectValue placeholder="Select timeline" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="asap">ASAP</SelectItem>
+                          <SelectItem value="30_60">30–60 days</SelectItem>
+                          <SelectItem value="60_90">60–90 days</SelectItem>
+                          <SelectItem value="90_plus">90+ days</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="seller_hoa_fee">HOA Fee (monthly)</Label>
+                      <Input
+                        id="seller_hoa_fee"
+                        type="number"
+                        value={newLead.preferences?.seller_hoa_fee || ''}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: { ...newLead.preferences, seller_hoa_fee: e.target.value }
+                        })}
+                        placeholder="0"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="seller_description">Listing Notes</Label>
+                    <Textarea
+                      id="seller_description"
+                      value={newLead.preferences?.seller_description || ''}
+                      onChange={(e) => setNewLead({
+                        ...newLead,
+                        preferences: { ...newLead.preferences, seller_description: e.target.value }
+                      })}
+                      placeholder="Upgrades, repairs needed, highlights, etc."
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="zipcode">Preferred Zipcode</Label>
+                      <Input
+                        id="zipcode"
+                        value={newLead.preferences.zipcode}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: {...newLead.preferences, zipcode: e.target.value}
+                        })}
+                        placeholder="90210"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="bedrooms">Bedrooms</Label>
+                      <Input
+                        id="bedrooms"
+                        type="number"
+                        value={newLead.preferences.bedrooms}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: {...newLead.preferences, bedrooms: e.target.value}
+                        })}
+                        placeholder="3"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="min_price">Min Price</Label>
+                      <Input
+                        id="min_price"
+                        type="number"
+                        value={newLead.preferences.min_price}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: {...newLead.preferences, min_price: e.target.value}
+                        })}
+                        placeholder="300000"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="max_price">Max Price</Label>
+                      <Input
+                        id="max_price"
+                        type="number"
+                        value={newLead.preferences.max_price}
+                        onChange={(e) => setNewLead({
+                          ...newLead,
+                          preferences: {...newLead.preferences, max_price: e.target.value}
+                        })}
+                        placeholder="500000"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="bathrooms">Bathrooms</Label>
+                    <Input
+                      id="bathrooms"
+                      type="number"
+                      step="0.5"
+                      value={newLead.preferences.bathrooms}
+                      onChange={(e) => setNewLead({
+                        ...newLead,
+                        preferences: {...newLead.preferences, bathrooms: e.target.value}
+                      })}
+                      placeholder="2"
+                    />
+                  </div>
+                </>
+              )}
             </TabsContent>
           </Tabs>
           <div className="flex justify-end space-x-2">
@@ -667,6 +1066,295 @@ export default function RealEstateCRM() {
                 />
               </div>
             </div>
+
+            {/* Details */}
+            <div className="mt-6 space-y-4">
+              <h4 className="font-medium">Details</h4>
+              {selectedLead.lead_type === 'seller' ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-seller_address">Property Address</Label>
+                    <Input
+                      id="edit-seller_address"
+                      value={selectedLead.preferences?.seller_address || ''}
+                      onChange={(e) => setSelectedLead({
+                        ...selectedLead,
+                        preferences: { ...selectedLead.preferences, seller_address: e.target.value }
+                      })}
+                      placeholder="123 Main St, City, State, ZIP"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-seller_price">Asking Price</Label>
+                    <Input
+                      id="edit-seller_price"
+                      type="number"
+                      value={selectedLead.preferences?.seller_price || ''}
+                      onChange={(e) => setSelectedLead({
+                        ...selectedLead,
+                        preferences: { ...selectedLead.preferences, seller_price: e.target.value }
+                      })}
+                      placeholder="500000"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_property_type">Property Type</Label>
+                      <Select
+                        value={selectedLead.preferences?.seller_property_type || ''}
+                        onValueChange={(v) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_property_type: v }
+                        })}
+                      >
+                        <SelectTrigger id="edit-seller_property_type">
+                          <SelectValue placeholder="Select type" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="single_family">Single Family</SelectItem>
+                          <SelectItem value="condo">Condo</SelectItem>
+                          <SelectItem value="townhouse">Townhouse</SelectItem>
+                          <SelectItem value="multi_family">Multi-Family</SelectItem>
+                          <SelectItem value="land">Land</SelectItem>
+                          <SelectItem value="other">Other</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="edit-seller_bedrooms">Bedrooms</Label>
+                        <Input
+                          id="edit-seller_bedrooms"
+                          type="number"
+                          value={selectedLead.preferences?.seller_bedrooms || ''}
+                          onChange={(e) => setSelectedLead({
+                            ...selectedLead,
+                            preferences: { ...selectedLead.preferences, seller_bedrooms: e.target.value }
+                          })}
+                          placeholder="3"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="edit-seller_bathrooms">Bathrooms</Label>
+                        <Input
+                          id="edit-seller_bathrooms"
+                          type="number"
+                          step="0.5"
+                          value={selectedLead.preferences?.seller_bathrooms || ''}
+                          onChange={(e) => setSelectedLead({
+                            ...selectedLead,
+                            preferences: { ...selectedLead.preferences, seller_bathrooms: e.target.value }
+                          })}
+                          placeholder="2"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_year_built">Year Built</Label>
+                      <Input
+                        id="edit-seller_year_built"
+                        type="number"
+                        value={selectedLead.preferences?.seller_year_built || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_year_built: e.target.value }
+                        })}
+                        placeholder="1998"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_square_feet">Square Feet</Label>
+                      <Input
+                        id="edit-seller_square_feet"
+                        type="number"
+                        value={selectedLead.preferences?.seller_square_feet || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_square_feet: e.target.value }
+                        })}
+                        placeholder="1800"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_lot_size">Lot Size (sq ft)</Label>
+                      <Input
+                        id="edit-seller_lot_size"
+                        type="number"
+                        value={selectedLead.preferences?.seller_lot_size || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_lot_size: e.target.value }
+                        })}
+                        placeholder="6500"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_condition">Condition</Label>
+                      <Select
+                        value={selectedLead.preferences?.seller_condition || ''}
+                        onValueChange={(v) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_condition: v }
+                        })}
+                      >
+                        <SelectTrigger id="edit-seller_condition">
+                          <SelectValue placeholder="Select condition" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="needs_work">Needs work</SelectItem>
+                          <SelectItem value="average">Average</SelectItem>
+                          <SelectItem value="good">Good</SelectItem>
+                          <SelectItem value="excellent">Excellent</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_occupancy">Occupancy</Label>
+                      <Select
+                        value={selectedLead.preferences?.seller_occupancy || ''}
+                        onValueChange={(v) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_occupancy: v }
+                        })}
+                      >
+                        <SelectTrigger id="edit-seller_occupancy">
+                          <SelectValue placeholder="Select occupancy" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="owner">Owner-occupied</SelectItem>
+                          <SelectItem value="tenant">Tenant-occupied</SelectItem>
+                          <SelectItem value="vacant">Vacant</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_timeline">Timeline to List</Label>
+                      <Select
+                        value={selectedLead.preferences?.seller_timeline || ''}
+                        onValueChange={(v) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_timeline: v }
+                        })}
+                      >
+                        <SelectTrigger id="edit-seller_timeline">
+                          <SelectValue placeholder="Select timeline" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="asap">ASAP</SelectItem>
+                          <SelectItem value="30_60">30–60 days</SelectItem>
+                          <SelectItem value="60_90">60–90 days</SelectItem>
+                          <SelectItem value="90_plus">90+ days</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-seller_hoa_fee">HOA Fee (monthly)</Label>
+                      <Input
+                        id="edit-seller_hoa_fee"
+                        type="number"
+                        value={selectedLead.preferences?.seller_hoa_fee || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: { ...selectedLead.preferences, seller_hoa_fee: e.target.value }
+                        })}
+                        placeholder="0"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-seller_description">Listing Notes</Label>
+                    <Textarea
+                      id="edit-seller_description"
+                      value={selectedLead.preferences?.seller_description || ''}
+                      onChange={(e) => setSelectedLead({
+                        ...selectedLead,
+                        preferences: { ...selectedLead.preferences, seller_description: e.target.value }
+                      })}
+                      placeholder="Upgrades, repairs needed, highlights, etc."
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-zipcode">Preferred Zipcode</Label>
+                      <Input
+                        id="edit-zipcode"
+                        value={selectedLead.preferences?.zipcode || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: {...selectedLead.preferences, zipcode: e.target.value}
+                        })}
+                        placeholder="90210"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-bedrooms">Bedrooms</Label>
+                      <Input
+                        id="edit-bedrooms"
+                        type="number"
+                        value={selectedLead.preferences?.bedrooms || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: {...selectedLead.preferences, bedrooms: e.target.value}
+                        })}
+                        placeholder="3"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-min_price">Min Price</Label>
+                      <Input
+                        id="edit-min_price"
+                        type="number"
+                        value={selectedLead.preferences?.min_price || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: {...selectedLead.preferences, min_price: e.target.value}
+                        })}
+                        placeholder="300000"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="edit-max_price">Max Price</Label>
+                      <Input
+                        id="edit-max_price"
+                        type="number"
+                        value={selectedLead.preferences?.max_price || ''}
+                        onChange={(e) => setSelectedLead({
+                          ...selectedLead,
+                          preferences: {...selectedLead.preferences, max_price: e.target.value}
+                        })}
+                        placeholder="500000"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-bathrooms">Bathrooms</Label>
+                    <Input
+                      id="edit-bathrooms"
+                      type="number"
+                      step="0.5"
+                      value={selectedLead.preferences?.bathrooms || ''}
+                      onChange={(e) => setSelectedLead({
+                        ...selectedLead,
+                        preferences: {...selectedLead.preferences, bathrooms: e.target.value}
+                      })}
+                      placeholder="2"
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+
             <div className="flex justify-end space-x-2">
               <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>
                 Cancel
@@ -679,14 +1367,135 @@ export default function RealEstateCRM() {
         </Dialog>
       )}
 
+      {/* Start Transaction from Lead Dialog */}
+      <Dialog open={isStartTransDialogOpen} onOpenChange={setIsStartTransDialogOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Start Transaction</DialogTitle>
+            <DialogDescription>
+              Prefilled from the selected lead. Adjust details and create the transaction.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 gap-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="draft-client-name">Client Name *</Label>
+                  <Input
+                    id="draft-client-name"
+                    value={transactionDraft.client_name}
+                    onChange={(e) => setTransactionDraft({ ...transactionDraft, client_name: e.target.value })}
+                    placeholder="John Smith"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="draft-transaction-type">Transaction Type</Label>
+                  <Select
+                    value={transactionDraft.transaction_type}
+                    onValueChange={(value) => setTransactionDraft({ ...transactionDraft, transaction_type: value })}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="sale">Sale (Seller)</SelectItem>
+                      <SelectItem value="purchase">Purchase (Buyer)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="draft-property-address">Property Address {transactionDraft.transaction_type === 'sale' ? '*' : '(optional)'}</Label>
+                <Input
+                  id="draft-property-address"
+                  value={transactionDraft.property_address}
+                  onChange={(e) => setTransactionDraft({ ...transactionDraft, property_address: e.target.value })}
+                  placeholder="123 Main Street, City, State, ZIP"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="draft-client-email">Client Email</Label>
+                  <Input
+                    id="draft-client-email"
+                    type="email"
+                    value={transactionDraft.client_email}
+                    onChange={(e) => setTransactionDraft({ ...transactionDraft, client_email: e.target.value })}
+                    placeholder="client@email.com"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="draft-client-phone">Client Phone</Label>
+                  <Input
+                    id="draft-client-phone"
+                    value={transactionDraft.client_phone}
+                    onChange={(e) => setTransactionDraft({ ...transactionDraft, client_phone: e.target.value })}
+                    placeholder="(555) 123-4567"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="draft-assigned-agent">Assigned Agent</Label>
+                  <Input
+                    id="draft-assigned-agent"
+                    value={transactionDraft.assigned_agent}
+                    onChange={(e) => setTransactionDraft({ ...transactionDraft, assigned_agent: e.target.value })}
+                    placeholder="Agent Name"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="draft-listing-price">Listing/Target Price</Label>
+                  <Input
+                    id="draft-listing-price"
+                    type="number"
+                    value={transactionDraft.listing_price}
+                    onChange={(e) => setTransactionDraft({ ...transactionDraft, listing_price: e.target.value })}
+                    placeholder="500000"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="draft-closing-date">Expected Closing Date</Label>
+                <Input
+                  id="draft-closing-date"
+                  type="date"
+                  value={transactionDraft.closing_date}
+                  onChange={(e) => setTransactionDraft({ ...transactionDraft, closing_date: e.target.value })}
+                />
+              </div>
+            </div>
+          </div>
+          <div className="flex justify-end space-x-2 pt-2">
+            <Button variant="outline" onClick={() => setIsStartTransDialogOpen(false)}>Cancel</Button>
+            <Button
+              onClick={createTransactionFromLead}
+              disabled={loading || !transactionDraft.client_name || (transactionDraft.transaction_type === 'sale' && !transactionDraft.property_address)}
+            >
+              {loading ? 'Creating...' : 'Create Transaction'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Property Matches Dialog */}
       {propertyMatches && (
         <Dialog open={!!propertyMatches} onOpenChange={() => setPropertyMatches(null)}>
           <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
             <DialogHeader>
-              <DialogTitle>AI Property Matches</DialogTitle>
+              <DialogTitle>
+                {(propertyMatches?.filter_policy === 'seller_no_search' || propertyMatches?.updated_lead?.lead_type === 'seller')
+                  ? 'AI Seller Insights'
+                  : 'AI Property Matches'}
+              </DialogTitle>
               <DialogDescription>
-                Found {propertyMatches.total_found} properties. Here are the top matches:
+                {(propertyMatches?.filter_policy === 'seller_no_search' || propertyMatches?.updated_lead?.lead_type === 'seller')
+                  ? "Seller-focused insights based on the subject property (address and asking price)."
+                  : <>Found {propertyMatches.total_found} properties. Here are the top matches:</>}
               </DialogDescription>
             </DialogHeader>
             
@@ -696,37 +1505,40 @@ export default function RealEstateCRM() {
                   <Sparkles className="mr-2 h-4 w-4" />
                   AI Recommendations
                 </h4>
-                <p className="text-sm whitespace-pre-line">{propertyMatches.ai_recommendations}</p>
+                <MarkdownText text={propertyMatches.ai_recommendations} className="text-sm" />
               </div>
             )}
             
-            <div className="grid gap-4">
-              {propertyMatches.properties.slice(0, 5).map((property, index) => (
-                <Card key={index}>
-                  <CardContent className="p-4">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <h4 className="font-semibold">{property.address || `Property #${index + 1}`}</h4>
-                        <p className="text-sm text-muted-foreground">{property.city}, {property.state} {property.zipcode}</p>
-                        <div className="flex gap-4 mt-2">
-                          {property.bedrooms && <span className="text-sm">🛏️ {property.bedrooms} bed</span>}
-                          {property.bathrooms && <span className="text-sm">🛁 {property.bathrooms} bath</span>}
-                          {property.square_feet && <span className="text-sm">📐 {property.square_feet} sq ft</span>}
+            {(propertyMatches?.filter_policy !== 'seller_no_search' && propertyMatches?.updated_lead?.lead_type !== 'seller') && (
+              <div className="grid gap-4">
+                {propertyMatches.properties.slice(0, 5).map((property, index) => (
+                  <Card key={index}>
+                    <CardContent className="p-4">
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <h4 className="font-semibold">{property.address || `Property #${index + 1}`}</h4>
+                          <p className="text-sm text-muted-foreground">{property.city}, {property.state} {property.zipcode}</p>
+                          <div className="flex gap-4 mt-2">
+                            {property.bedrooms && <span className="text-sm">🛏️ {property.bedrooms} bed</span>}
+                            {property.bathrooms && <span className="text-sm">🛁 {property.bathrooms} bath</span>}
+                            {property.square_feet && <span className="text-sm">📐 {property.square_feet} sq ft</span>}
+                          </div>
                         </div>
+                        {property.price && (
+                          <div className="text-right">
+                            <p className="text-lg font-bold text-primary">{formatCurrency(property.price)}</p>
+                          </div>
+                        )}
                       </div>
-                      {property.price && (
-                        <div className="text-right">
-                          <p className="text-lg font-bold text-primary">{formatCurrency(property.price)}</p>
-                        </div>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
           </DialogContent>
         </Dialog>
       )}
-    </div>
+    </SidebarInset>
+    </SidebarProvider>
   )
 }

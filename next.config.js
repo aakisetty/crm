@@ -8,19 +8,14 @@ const nextConfig = {
     serverComponentsExternalPackages: ['mongodb'],
   },
   webpack(config, { dev }) {
-    if (dev) {
-      // Reduce CPU/memory from file watching
-      config.watchOptions = {
-        poll: 2000, // check every 2 seconds
-        aggregateTimeout: 300, // wait before rebuilding
-        ignored: ['**/node_modules'],
-      };
-    }
+    // Use Next.js defaults for file watching in dev to avoid HMR/asset 404 issues
+    // Remove custom watchOptions that were too aggressive and could evict entries.
     return config;
   },
+  // Increase thresholds to prevent on-demand entry disposal causing 404s for dev assets
   onDemandEntries: {
-    maxInactiveAge: 10000,
-    pagesBufferLength: 2,
+    maxInactiveAge: 120000, // 2 minutes (default ~60s). Higher to be safe.
+    pagesBufferLength: 10,  // keep more pages/chunks in memory
   },
   async headers() {
     return [

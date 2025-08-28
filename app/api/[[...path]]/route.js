@@ -7,12 +7,345 @@ let client
 let db
 
 async function connectToMongo() {
-  if (!client) {
-    client = new MongoClient(process.env.MONGO_URL)
-    await client.connect()
-    db = client.db(process.env.DB_NAME)
+  // Return existing connection if available
+  if (db) return db
+
+  const url = process.env.MONGO_URL
+  const name = process.env.DB_NAME
+
+  // Development fallback: use an in-memory stub when env vars are missing
+  if (!url || !name) {
+    console.warn('⚠️  MONGO_URL or DB_NAME not set – using in-memory stub DB (development only).')
+    db = {
+      _data: {},
+      collection(col) {
+        if (!this._data[col]) this._data[col] = []
+        const list = this._data[col]
+        return {
+          find(query = {}) {
+            // minimal filter support for equality on top-level fields
+            const matches = (doc) => {
+              for (const [k, v] of Object.entries(query || {})) {
+                if (doc[k] !== v) return false
+              }
+              return true
+            }
+            const results = list.filter(matches)
+            return {
+              sort: () => ({
+              toArray: async () => results,
+              limit: () => ({ toArray: async () => results })
+            }),
+              limit: () => ({ toArray: async () => results }),
+              toArray: async () => results
+            }
+          },
+          findOne(filter = {}) {
+            return list.find((d) => d.id === filter.id)
+          },
+          countDocuments: async (filter = undefined) => {
+            if (!filter || Object.keys(filter).length === 0) return list.length
+            return list.filter((d) => {
+              for (const [k, v] of Object.entries(filter)) { if (d[k] !== v) return false }
+              return true
+            }).length
+          },
+          insertOne: async (doc) => {
+            const id = doc.id || uuidv4()
+            list.push({ ...doc, id })
+            return { insertedId: id }
+          },
+          updateOne: async (filter, { $set }) => {
+            const idx = list.findIndex((d) => d.id === filter.id)
+            if (idx !== -1) {
+              list[idx] = { ...list[idx], ...$set }
+              return { matchedCount: 1 }
+            }
+            return { matchedCount: 0 }
+          },
+          deleteMany: async (filter = {}) => {
+            const keep = []
+            let deletedCount = 0
+            for (const d of list) {
+              let match = true
+              for (const [k, v] of Object.entries(filter)) { if (d[k] !== v) { match = false; break } }
+              if (match) { deletedCount++ } else { keep.push(d) }
+            }
+            // mutate the original array in place
+            list.length = 0
+            for (const d of keep) list.push(d)
+            return { deletedCount }
+          },
+          deleteOne: async (filter) => {
+            const idx = list.findIndex((d) => d.id === filter.id)
+            if (idx !== -1) {
+              list.splice(idx, 1)
+              return { deletedCount: 1 }
+            }
+            return { deletedCount: 0 }
+          }
+        }
+      }
+    }
+    return db
   }
+
+  // Normal Mongo connection
+  if (!client) {
+    client = new MongoClient(url)
+    await client.connect()
+  }
+  db = client.db(name)
   return db
+}
+
+// Fetch images for a single property by provider ID or address parts
+async function fetchPropertyImages(query = {}) {
+  const { id, address, city, state, zipcode } = query
+  try {
+    // Prepare multiple precise body shapes to avoid ambiguous queries
+    const attempts = []
+    if (id) {
+      attempts.push({ id })
+      attempts.push({ property_id: id })
+      attempts.push({ propertyId: id })
+      attempts.push({ mls_id: id })
+      attempts.push({ mlsId: id })
+    }
+    if (address || city || state || zipcode) {
+      // Structured address
+      attempts.push({ address: address || undefined, city: city || undefined, state: state || undefined, zip: zipcode || undefined })
+      // Alternate street key
+      if (address) attempts.push({ street: address, city: city || undefined, state: state || undefined, zip: zipcode || undefined })
+      if (address) attempts.push({ street_address: address, city: city || undefined, state: state || undefined, zip: zipcode || undefined })
+      if (address) attempts.push({ address_line1: address, city: city || undefined, state: state || undefined, zip: zipcode || undefined })
+      // Full address string as last resort
+      const parts = []
+      if (address) parts.push(address)
+      const cityStateZip = [city, state, zipcode].filter(Boolean).join(' ')
+      if (cityStateZip) parts.push(cityStateZip)
+      const full = parts.join(', ')
+      if (full) attempts.push({ address: full })
+    }
+
+    const endpoints = [
+      'https://api.realestateapi.com/v2/PropertyDetail',
+      'https://api.realestateapi.com/v2/PropertyDetails',
+      'https://api.realestateapi.com/v2/Property',
+    ]
+
+    let detail = null
+    let lastErr = null
+    for (const url of endpoints) {
+      for (const body of attempts) {
+        try {
+          const controller = new AbortController()
+          const attemptTimeoutMs = 10000
+          const timeoutRef = setTimeout(() => controller.abort(new Error('Request timed out')), attemptTimeoutMs)
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              accept: 'application/json',
+              'content-type': 'application/json',
+              'x-api-key': process.env.REAL_ESTATE_API_KEY,
+              'x-user-id': process.env.REAL_ESTATE_USER_ID || 'CRMApp'
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal
+          })
+          clearTimeout(timeoutRef)
+          if (!res.ok) {
+            lastErr = new Error(`Detail ${url} ${res.status}`)
+            continue
+          }
+          detail = await res.json()
+          break
+        } catch (e) {
+          lastErr = e
+          continue
+        }
+      }
+      if (detail) break
+    }
+
+    if (!detail) {
+      if (lastErr) console.warn('Property detail fetch failed', lastErr)
+      return { images: [], primary_image: null, debug_detail: null }
+    }
+
+    // Collect image URLs robustly
+    const urls = []
+    const pushUrl = (u) => {
+      if (!u || typeof u !== 'string') return
+      const s = u.trim()
+      if (!/^https?:\/\//i.test(s)) return
+      urls.push(s)
+    }
+    const urlFromObj = (o) => o && (o.url || o.href || o.src || o.link || o.image || o.photo || o.mediaUrl || o.media_url || o.full || o.large || o.original || o.medium || o.small || o.thumb || o.thumbnail || o.url_full || o.url_small || o.url_thumb || o.thumbnail_url)
+
+    const seen = new Set()
+    const queue = [{ obj: detail, depth: 0 }]
+    const maxDepth = 5
+    while (queue.length) {
+      const { obj, depth } = queue.shift()
+      if (!obj || typeof obj !== 'object' || seen.has(obj) || depth > maxDepth) continue
+      seen.add(obj)
+      if (Array.isArray(obj)) {
+        for (const v of obj) {
+          if (typeof v === 'string') pushUrl(v)
+          else if (typeof v === 'object') {
+            const u = urlFromObj(v)
+            if (u) pushUrl(u)
+            queue.push({ obj: v, depth: depth + 1 })
+          }
+        }
+      } else {
+        for (const [k, v] of Object.entries(obj)) {
+          const key = k.toLowerCase()
+          if (typeof v === 'string') {
+            if (key.includes('url') || key.includes('photo') || key.includes('image')) pushUrl(v)
+          } else if (typeof v === 'object') {
+            const u = urlFromObj(v)
+            if (u) pushUrl(u)
+            // Prioritize obvious containers
+            if (Array.isArray(v) || key.includes('photo') || key.includes('image') || key.includes('media')) {
+              queue.push({ obj: v, depth: depth + 1 })
+            }
+          }
+        }
+      }
+    }
+
+    // Dedupe
+    const out = []
+    const seenUrl = new Set()
+    for (const u of urls) {
+      if (!seenUrl.has(u)) { seenUrl.add(u); out.push(u) }
+    }
+
+    return {
+      images: out,
+      primary_image: out[0] || null,
+      debug_detail: process.env.NODE_ENV !== 'production' ? detail : undefined
+    }
+  } catch (error) {
+    console.error('fetchPropertyImages error', error)
+    return { images: [], primary_image: null }
+  }
+}
+
+// Query MLS Search for photos by address/city/state/zip or listing id
+async function fetchMLSPhotos(query = {}) {
+  const { id, address, city, state, zipcode } = query
+  try {
+    const url = 'https://api.realestateapi.com/v2/MLSSearch'
+    // MLSSearch expects top-level fields (no filters wrapper)
+    const body = {
+      size: 5,
+      address: address || undefined,
+      city: city || undefined,
+      state: state || undefined,
+      zip: zipcode || undefined,
+      listing_id: id || undefined,
+      property_id: id || undefined
+    }
+
+    // Use AbortController-based timeout
+    let res
+    {
+      const controller = new AbortController()
+      const timeoutMs = 8000
+      const timeoutRef = setTimeout(() => controller.abort(new Error('Request timed out')), timeoutMs)
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'x-api-key': process.env.REAL_ESTATE_MLS_API_KEY || process.env.REAL_ESTATE_API_KEY,
+            'x-user-id': process.env.REAL_ESTATE_USER_ID || 'CRMApp'
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        })
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          console.warn('MLSSearch request aborted (timeout)')
+          return { images: [], primary_image: null }
+        }
+        throw err
+      } finally {
+        clearTimeout(timeoutRef)
+      }
+    }
+
+    if (!res.ok) {
+      let errTxt = ''
+      try { errTxt = await res.text() } catch {}
+      console.warn('MLSSearch request failed', res.status, errTxt?.slice(0, 300))
+      return { images: [], primary_image: null }
+    }
+
+    const data = await res.json()
+    const items = Array.isArray(data?.results) ? data.results : (Array.isArray(data) ? data : [])
+    if (items.length === 0) return { images: [], primary_image: null }
+
+    // Reuse robust URL extraction on the first couple of items
+    const urls = []
+    const pushUrl = (u) => {
+      if (!u || typeof u !== 'string') return
+      const s = u.trim()
+      if (!/^https?:\/\//i.test(s)) return
+      urls.push(s)
+    }
+    const urlFromObj = (o) => o && (o.url || o.href || o.src || o.link || o.image || o.photo || o.mediaUrl || o.media_url || o.full || o.large || o.original || o.medium || o.small || o.thumb || o.thumbnail || o.url_full || o.url_small || o.url_thumb || o.thumbnail_url)
+    const scan = (root) => {
+      const seen = new Set()
+      const queue = [{ obj: root, depth: 0 }]
+      const maxDepth = 5
+      while (queue.length) {
+        const { obj, depth } = queue.shift()
+        if (!obj || typeof obj !== 'object' || seen.has(obj) || depth > maxDepth) continue
+        seen.add(obj)
+        if (Array.isArray(obj)) {
+          for (const v of obj) {
+            if (typeof v === 'string') pushUrl(v)
+            else if (typeof v === 'object') {
+              const u = urlFromObj(v)
+              if (u) pushUrl(u)
+              queue.push({ obj: v, depth: depth + 1 })
+            }
+          }
+        } else {
+          for (const [k, v] of Object.entries(obj)) {
+            const key = k.toLowerCase()
+            if (typeof v === 'string') {
+              if (key.includes('url') || key.includes('photo') || key.includes('image')) pushUrl(v)
+            } else if (typeof v === 'object') {
+              const u = urlFromObj(v)
+              if (u) pushUrl(u)
+              if (Array.isArray(v) || key.includes('photo') || key.includes('image') || key.includes('media')) {
+                queue.push({ obj: v, depth: depth + 1 })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Scan first up to 3 results
+    items.slice(0, 3).forEach(scan)
+
+    // Dedupe
+    const out = []
+    const seenUrl = new Set()
+    for (const u of urls) { if (!seenUrl.has(u)) { seenUrl.add(u); out.push(u) } }
+
+    return { images: out, primary_image: out[0] || null, debug_mls_sample: process.env.NODE_ENV !== 'production' ? items[0] : undefined }
+  } catch (e) {
+    console.warn('fetchMLSPhotos error', e)
+    return { images: [], primary_image: null }
+  }
 }
 
 // Enhanced OpenAI Agent Utilities with advanced features
@@ -176,8 +509,20 @@ class OpenAIUtility {
       presencePenalty = 0,
       stop = null,
       skipBudgetCheck = false,
-      customRetries = null
+      customRetries = null,
+      // Timeouts (ms): separate defaults for streaming vs non-streaming
+      requestTimeoutMs = 20000,
+      streamTimeoutMs = 60000
     } = options
+
+    // Map deprecated/alias model names
+    if (model === 'o1-mini') {
+      // 'o1-mini' is an internal alias for 'gpt-4o-mini'.
+      // The public OpenAI endpoint rejects the former with
+      // "unsupported_value: messages[0].role does not support 'system'"
+      // so we transparently switch to the supported model name.
+      model = 'gpt-4o-mini'
+    }
 
     // Validate model
     if (!this.tokenLimits[model]) {
@@ -234,7 +579,11 @@ class OpenAIUtility {
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
       const requestStart = Date.now()
       
+      let timeoutRef
+      const controller = new AbortController()
+      const timeoutMs = stream ? streamTimeoutMs : requestTimeoutMs
       try {
+        timeoutRef = setTimeout(() => controller.abort(new Error('Request timed out')), timeoutMs)
         const response = await fetch(`${this.baseURL}/chat/completions`, {
           method: 'POST',
           headers: {
@@ -242,7 +591,8 @@ class OpenAIUtility {
             'Content-Type': 'application/json',
             'User-Agent': 'RealEstate-CRM/1.0'
           },
-          body: JSON.stringify(requestPayload)
+          body: JSON.stringify(requestPayload),
+          signal: controller.signal
         })
 
         const responseTime = Date.now() - requestStart
@@ -300,7 +650,6 @@ class OpenAIUtility {
         error.status = response.status
         error.data = errorData
         throw error
-
       } catch (error) {
         lastError = error
         const errorInfo = this.classifyError(error)
@@ -330,6 +679,8 @@ class OpenAIUtility {
         
         // Wait before retry
         await new Promise(resolve => setTimeout(resolve, delay))
+      } finally {
+        if (timeoutRef) clearTimeout(timeoutRef)
       }
     }
 
@@ -430,7 +781,6 @@ class OpenAIUtility {
 // Create global instance
 const openaiUtility = new OpenAIUtility()
 
-// Enhanced callOpenAI function with all features
 async function callOpenAI(model = 'gpt-4o-mini', messages, options = {}) {
   return await openaiUtility.callOpenAI(model, messages, options)
 }
@@ -447,45 +797,121 @@ async function fetchProperties(filters = {}) {
       listing_status = 'for_sale',
       property_type,
       sort_by,
-      limit = 20,
+      limit = 60,
       offset = 0
     } = filters
 
-    // Use the specific endpoint requested
-    const baseUrl = 'https://api.realestateapi.com/v1/properties'
-    const params = new URLSearchParams()
-    
-    // Required filters
-    params.append('listing_status', listing_status)
-    
-    // Optional filters
-    if (location) params.append('location', location)
-    if (beds) params.append('beds', beds.toString())
-    if (baths) params.append('baths', baths.toString())
-    if (min_price) params.append('min_price', min_price.toString())
-    if (max_price) params.append('max_price', max_price.toString())
-    if (property_type) params.append('property_type', property_type)
-    if (sort_by) params.append('sort_by', sort_by)
-    if (limit) params.append('limit', limit.toString())
-    if (offset) params.append('offset', offset.toString())
+    // Use the v2 MLSSearch endpoint (POST)
+    const url = (process.env.PROPERTY_SEARCH_URL || 'https://api.realestateapi.com/v2/MLSSearch')
 
-    const url = `${baseUrl}?${params.toString()}`
-    
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'X-API-Key': process.env.REAL_ESTATE_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      timeout: 10000 // 10 second timeout
-    })
+    // Build MLSSearch request body
+    const requestBody = {
+      // core required filters per product decision
+      size: Math.min(250, Number(limit) || 60),
+      active: true,
+      sold: false,
+      has_photos: true,
+      include_photos: true,
+      // pass-through if provided
+      property_type: property_type || undefined
+    }
+    // Pagination with MLSSearch uses resultIndex (1-based per API samples)
+    if (Number(offset) > 0) {
+      requestBody.resultIndex = Number(offset)
+    }
+
+    // Map filters -> MLSSearch schema
+    if (beds) requestBody.bedrooms_min = Number(beds)
+    if (baths) requestBody.bathrooms_min = Number(baths)
+    if (min_price) requestBody.listing_price_min = Number(min_price)
+    if (max_price) requestBody.listing_price_max = Number(max_price)
+
+    if (location) {
+      // Normalize location: support ZIP, ZIP+4, "City, ST", full state name, or 2-letter state code
+      const stateMap = {
+        alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO',
+        connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC', florida: 'FL', georgia: 'GA',
+        hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY',
+        louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA', michigan: 'MI', minnesota: 'MN',
+        mississippi: 'MS', missouri: 'MO', montana: 'MT', nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH',
+        'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND',
+        ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+        'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT', vermont: 'VT', virginia: 'VA',
+        washington: 'WA', 'west virginia': 'WV', wisconsin: 'WI', wyoming: 'WY'
+      }
+      const normalizeStateAbbr = (s) => {
+        if (!s) return null
+        const t = String(s).trim()
+        if (/^[A-Za-z]{2}$/.test(t)) return t.toUpperCase()
+        const key = t.toLowerCase()
+        return stateMap[key] || null
+      }
+      const loc = String(location).trim()
+      if (/^\d{5}(-\d{4})?$/.test(loc)) {
+         requestBody.zip = loc.slice(0, 5)
+      } else if (loc.includes(',')) {
+        const [cityPart, statePart] = loc.split(',').map(s => s.trim()).slice(0, 2)
+        if (cityPart) requestBody.city = cityPart
+        const st = normalizeStateAbbr(statePart)
+        if (st) requestBody.state = st
+      } else {
+        const st = normalizeStateAbbr(loc)
+        if (st) {
+          requestBody.state = st
+        } else {
+          requestBody.city = loc
+        }
+      }
+    }
+
+    // Temporarily omit sort to avoid 400 errors while we confirm other fields
+    // if (sort_by) {
+    //   const sortMap = {
+    //     'price_asc': { list_price: 'asc' },
+    //     'price_desc': { list_price: 'desc' },
+    //     'date_desc': { list_date: 'desc' },
+    //   };
+    //   if (sortMap[sort_by]) {
+    //     requestBody.sort = sortMap[sort_by];
+    //   }
+    // }
+
+
+    // Use AbortController for a hard timeout (Node/Next fetch doesn't support a 'timeout' option)
+    const controller = new AbortController()
+    const timeoutMs = 10000
+    const timeoutRef = setTimeout(() => controller.abort(new Error('Request timed out')), timeoutMs)
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          // Use MLS API key for MLSSearch
+          'x-api-key': process.env.REAL_ESTATE_MLS_API_KEY || process.env.REAL_ESTATE_API_KEY,
+          'x-user-id': process.env.REAL_ESTATE_USER_ID || 'CRMApp'
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal
+      })
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || /timed out/i.test(String(err.message || '')))) {
+        console.error('Real Estate API request aborted (timeout):', err)
+        return generateFallbackProperties(filters)
+      }
+      throw err
+    } finally {
+      clearTimeout(timeoutRef)
+    }
     
     if (!response.ok) {
+      const errorBody = await response.text();
       console.error('Real Estate API Error:', {
         status: response.status,
         statusText: response.statusText,
-        url: url
+        url: url,
+        response_body: errorBody
       })
       
       // Return fallback/mock data for development
@@ -493,39 +919,266 @@ async function fetchProperties(filters = {}) {
     }
     
     const data = await response.json()
-    
-    // Normalize response structure
-    const properties = data.properties || data.results || data.data || []
-    
-    // Add metadata
-    return {
-      properties: properties.map(property => ({
-        id: property.id || `prop_${Date.now()}_${Math.random()}`,
-        address: property.address || property.street_address,
-        city: property.city,
-        state: property.state,
-        zipcode: property.zipcode || property.zip_code,
-        price: property.price || property.list_price,
-        bedrooms: property.bedrooms || property.beds,
-        bathrooms: property.bathrooms || property.baths,
-        square_feet: property.square_feet || property.sqft,
-        property_type: property.property_type || property.type,
-        listing_status: property.listing_status || property.status,
-        description: property.description,
-        images: property.images || property.photos || [],
-        listing_date: property.listing_date || property.date_listed,
-        days_on_market: property.days_on_market || property.dom,
-        mls_number: property.mls_number || property.mls_id,
-        lot_size: property.lot_size,
-        year_built: property.year_built,
-        garage: property.garage,
-        pool: property.pool,
-        fireplace: property.fireplace
-      })),
-      total: data.total || data.count || properties.length,
-      has_more: data.has_more || false,
-      filters_applied: filters
-    }
+  // Normalize response structure (MLSSearch returns data[])
+  const rawProps = data.properties || data.results || data.data || []
+  
+  // Add metadata
+  const normalized = rawProps.map(src => {
+    // Prefer MLSSearch nested listing/public shapes
+    const listing = src?.listing || {}
+    const publicRec = src?.public || {}
+    const addrObj = listing.address || (src && typeof src.address === 'object' && src.address !== null ? src.address : null)
+    const street = (listing?.address?.unparsedAddress)
+      || (addrObj ? (addrObj.street || addrObj.address || addrObj.line1 || addrObj.line || '') : null)
+      || (src.street_address || src.address_line1 || src.street || src.address || '')
+    const city = (listing?.address?.city)
+      || (addrObj && (addrObj.city || addrObj.town)) || src.city || ''
+    const state = (listing?.address?.stateOrProvince)
+      || (addrObj && (addrObj.state || addrObj.region)) || src.state || ''
+    const zipcode = (listing?.address?.zipCode)
+      || (addrObj && (addrObj.zip || addrObj.zipcode || addrObj.postal_code))
+      || src.zipcode || src.zip_code || src.postal_code || ''
+
+    // Normalize price from various possible sources
+    const priceTuples = [
+        [listing?.leadTypes?.mlsListingPrice, 'listing.leadTypes.mlsListingPrice'],
+        [listing?.listPriceLow, 'listing.listPriceLow'],
+        [src.price, 'price'],
+        [src.list_price, 'list_price'],
+        [src.listPrice, 'listPrice'],
+        [src.listing_price, 'listing_price'],
+        [src.asking_price, 'asking_price'],
+        [src.current_price, 'current_price'],
+        [src.original_list_price, 'original_list_price'],
+        [src.originalListPrice, 'originalListPrice'],
+        [src.original_price, 'original_price'],
+        [src.close_price, 'close_price'],
+        [src.sold_price, 'sold_price'],
+        [src?.list?.price, 'list.price'],
+        [src?.prices?.list, 'prices.list'],
+        [src?.details?.list_price, 'details.list_price'],
+        [src?.listing?.list_price, 'listing.list_price'],
+        [src?.listing?.price, 'listing.price'],
+        [src?.price?.list, 'price.list'],
+      ].filter(([v]) => v !== undefined && v !== null)
+      const rawPrice = priceTuples.length > 0 ? priceTuples[0][0] : null
+      let price_source = priceTuples.length > 0 ? priceTuples[0][1] : undefined
+      let price = typeof rawPrice === 'string'
+        ? (rawPrice.trim() === '' ? null : Number(rawPrice.replace(/[^0-9.]/g, '')))
+        : (typeof rawPrice === 'number' ? rawPrice : null)
+
+      // Deep fallback: recursively search for any key containing 'price'
+      if (price == null) {
+        const seen = new Set()
+        const queue = [{ obj: src, depth: 0 }]
+        const maxDepth = 4
+        while (queue.length) {
+          const { obj, depth } = queue.shift()
+          if (!obj || typeof obj !== 'object' || seen.has(obj) || depth > maxDepth) continue
+          seen.add(obj)
+          for (const [k, v] of Object.entries(obj)) {
+            if (v == null) continue
+            const key = k.toLowerCase()
+            if (key.includes('price') || key === 'lp' || key === 'listprice' || key === 'list_price') {
+              if (typeof v === 'number') { price = v; price_source = k; break }
+              if (typeof v === 'string') {
+                const num = Number(v.replace(/[^0-9.]/g, ''))
+                if (!Number.isNaN(num)) { price = num; price_source = k; break }
+              }
+              if (typeof v === 'object' && v.amount) {
+                const num = typeof v.amount === 'string' ? Number(v.amount.replace(/[^0-9.]/g, '')) : v.amount
+                if (!Number.isNaN(num)) { price = num; price_source = `${k}.amount`; break }
+              }
+            }
+            if (typeof v === 'object') queue.push({ obj: v, depth: depth + 1 })
+          }
+          if (price != null) break
+        }
+      }
+
+      // Normalize images and a primary thumbnail from various possible sources
+      const urlFrom = (val) => {
+        if (!val) return null
+        if (typeof val === 'string') return val
+        if (typeof val === 'object') {
+          return (
+            val.url || val.href || val.src || val.link || val.image || val.photo ||
+            val.mediaUrl || val.media_url || val.highRes || val.midRes || val.lowRes || val.large || val.full ||
+            val.original || val.medium || val.small || val.thumb || val.thumbnail ||
+            val.url_full || val.url_small || val.url_thumb || val.thumbnail_url || null
+          )
+        }
+        return null
+      }
+      // Prefer media.primaryListingImageUrl and media.photosList if present (but we'll ignore in final return to keep MLSDetail enrichment only)
+      const media = src?.media || listing?.media
+      let images = []
+      if (media) {
+        if (typeof media.primaryListingImageUrl === 'string') images.push(media.primaryListingImageUrl)
+        if (Array.isArray(media.photosList)) {
+          media.photosList.forEach(p => {
+            const u = (p && (p.highRes || p.midRes || p.lowRes)) || urlFrom(p)
+            if (u) images.push(u)
+          })
+        }
+      }
+      // 1) Shallow candidates
+      const imageArrays = [
+        src.images,
+        src.photos,
+        src.photo_urls,
+        src.image_urls,
+        src?.media?.photos,
+        src?.media,
+        src?.images?.all,
+        src?.images,
+        src?.photos?.results,
+        src?.listing?.photos,
+        src.mlsPhotos,
+        src.mls_photos,
+        src.mls_photo_urls,
+        src.mlsPhotoUrls
+      ].filter(Boolean)
+      imageArrays.forEach(arr => {
+        if (Array.isArray(arr)) {
+          arr.forEach(it => {
+            const u = urlFrom(it)
+            if (u) images.push(u)
+          })
+        } else {
+          const u = urlFrom(arr)
+          if (u) images.push(u)
+        }
+      })
+
+      // 2) Recursive deep scan for any keys containing photo/image/media with URL-ish strings
+      const pushUrl = (u) => {
+        if (!u || typeof u !== 'string') return
+        const s = u.trim()
+        if (!/^https?:\/\//i.test(s)) return
+        images.push(s)
+      }
+      const seenDeep = new Set()
+      const queueDeep = [{ obj: src, depth: 0 }]
+      const maxDeep = 4
+      while (queueDeep.length) {
+        const { obj, depth } = queueDeep.shift()
+        if (!obj || typeof obj !== 'object' || seenDeep.has(obj) || depth > maxDeep) continue
+        seenDeep.add(obj)
+        if (Array.isArray(obj)) {
+          for (const v of obj) {
+            if (typeof v === 'string') pushUrl(v)
+            else if (typeof v === 'object') {
+              const u = urlFrom(v)
+              if (u) pushUrl(u)
+              queueDeep.push({ obj: v, depth: depth + 1 })
+            }
+          }
+        } else {
+          for (const [k, v] of Object.entries(obj)) {
+            const key = k.toLowerCase()
+            if (typeof v === 'string') {
+              if (key.includes('photo') || key.includes('image') || key.includes('media') || key.includes('thumbnail') || key.includes('url')) {
+                pushUrl(v)
+              }
+            } else if (typeof v === 'object') {
+              const u = urlFrom(v)
+              if (u) pushUrl(u)
+              if (Array.isArray(v) || key.includes('photo') || key.includes('image') || key.includes('media')) {
+                queueDeep.push({ obj: v, depth: depth + 1 })
+              }
+            }
+          }
+        }
+      }
+      const singlePrimary = urlFrom(
+        src.primary_photo_url || src.primaryImage || src.thumbnail_url || src.main_image_url || src.image_url || src.photo_url
+      )
+      if (singlePrimary) images.unshift(singlePrimary)
+      // Dedupe while preserving order
+      const seenImg = new Set()
+      images = images.filter(u => {
+        if (seenImg.has(u)) return false
+        seenImg.add(u)
+        return true
+      })
+      const primary_image = images.length > 0 ? images[0] : null
+
+      // Extract possible MLS listing id if available
+      const mls_id = (
+        listing?.mlsNumber || src.mls_listing_id || src.mlsListingId || src.mlsListingID || src.mls_id || src.mlsId || src.mls_number || src.mlsNumber ||
+        src.listing_id || src.listingId || src.id || null
+      )
+
+      // Prefer the provider's identifier if present
+      const provider_id = (
+        mls_id || src.id || src.property_id || src.propertyId ||
+        src.apn || src.parcel_number || src.parcelNumber || src.property_identifier || null
+      )
+
+      return {
+        id: provider_id || `prop_${Date.now()}_${Math.random()}`,
+        provider_id,
+        // Use only the street line for the title. City/State/ZIP are shown separately in the card.
+        address: street || [city, state].filter(Boolean).join(', '),
+        city,
+        state,
+        zipcode,
+        price,
+        price_source,
+        // Use photos returned inline from MLSSearch/media extraction.
+        primary_image,
+        bedrooms: (listing?.property?.bedroomsTotal ?? src.bedrooms ?? src.beds ?? publicRec?.bedrooms ?? null),
+        bathrooms: (listing?.property?.bathroomsTotal ?? src.bathrooms ?? src.baths ?? publicRec?.bathrooms ?? null),
+        square_feet: (listing?.property?.livingArea ?? src.square_feet ?? src.sqft ?? (publicRec?.squareFeet ? Number(publicRec.squareFeet) : null)),
+        property_type: (listing?.property?.propertyType || (Array.isArray(listing?.property?.propertySubType) && listing.property.propertySubType[0]) || src.property_type || src.type || ''),
+        listing_status: (listing?.standardStatus || listing?.customStatus || src.listing_status || src.status || ''),
+        description: src.description || '',
+        images,
+        listing_date: src.listing_date || src.date_listed || null,
+        days_on_market: src.days_on_market || src.dom || null,
+        mls_number: mls_id || src.mls_number || src.mls_id || null,
+        mls_id,
+        lot_size: (listing?.property?.lotSizeSquareFeet ?? (publicRec?.lotSquareFeet ? Number(publicRec.lotSquareFeet) : null) ?? src.lot_size ?? null),
+        year_built: (listing?.property?.yearBuilt ?? publicRec?.yearBuilt ?? src.year_built ?? null),
+        garage: src.garage || 0,
+        pool: src.pool || false,
+        fireplace: src.fireplace || false
+      }
+    })
+
+  // MLSDetail image enrichment removed: using MLSSearch include_photos and inline media.
+
+  // Pagination & totals (MLSSearch uses resultCount/resultIndex)
+  const computedTotal = (
+    typeof data.resultCount === 'number' ? data.resultCount :
+    (typeof data.total === 'number' ? data.total : (typeof data.count === 'number' ? data.count : null))
+  )
+  const returnedCount = Array.isArray(normalized) ? normalized.length : 0
+  const idx = typeof data.resultIndex === 'number' ? data.resultIndex : (Number(offset) || 1)
+  const computedHasMore = (typeof data.has_more === 'boolean')
+    ? data.has_more
+    : (computedTotal !== null && Number.isFinite(idx)
+        ? ((idx - 1) + returnedCount) < computedTotal
+        : (Number.isFinite(Number(limit)) ? returnedCount >= Number(limit) : false))
+
+  return {
+    properties: normalized,
+    total: computedTotal ?? returnedCount,
+    has_more: computedHasMore,
+    filters_applied: filters,
+    // Optional: include a raw provider sample for debugging (dev only)
+    debug_provider_sample: filters && (filters.include_raw || filters.debug) ? (rawProps[0] || null) : undefined,
+    debug_provider_keys: filters && (filters.include_raw || filters.debug) && rawProps[0]
+      ? Object.keys(rawProps[0])
+      : undefined,
+    // legacy debug fields for older UI snippets
+    debug_raw_sample: filters && (filters.include_raw || filters.debug) ? (rawProps[0] || null) : undefined,
+    debug_raw_sample_keys: filters && (filters.include_raw || filters.debug) && rawProps[0]
+      ? Object.keys(rawProps[0])
+      : undefined,
+    debug_enrichment: filters && (filters.include_raw || filters.debug) ? (filters._debug_enrichment || null) : undefined
+  }
   } catch (error) {
     console.error('Property Search Error:', error)
     
@@ -540,9 +1193,42 @@ async function searchProperties(filters = {}) {
   return result.properties || []
 }
 
-// Stage Transition Validation using o1-mini
+// Helpers ------------------------------
+// Remove null/undefined/empty-string values from prefs
+function sanitizePreferences(prefs = {}) {
+  const clean = {}
+  for (const [k, v] of Object.entries(prefs)) {
+    if (v !== null && v !== undefined && (typeof v !== 'string' || v.trim() !== '')) {
+      clean[k] = v
+    }
+  }
+  return clean
+}
+
+// Map Lead preferences to RealEstateAPI filter schema
+function mapLeadPreferencesToFilters(prefs = {}) {
+  if (!prefs || typeof prefs !== 'object') return {}
+  return {
+    location: prefs.zipcode || prefs.preferred_zipcode || prefs.location || undefined,
+    beds: prefs.bedrooms || prefs.beds || undefined,
+    baths: prefs.bathrooms || prefs.baths || undefined,
+    min_price: prefs.min_price || prefs.minPrice || undefined,
+    max_price: prefs.max_price || prefs.maxPrice || undefined,
+    property_type: prefs.property_type || prefs.type || undefined,
+  }
+}
+
+// Stage Transition Validation using o1-mini (aware of buyer vs seller flows)
 async function validateStageTransition(db, transactionId, currentStage, targetStage, force = false) {
   try {
+    // Load transaction to determine flow type
+    const tx = await db.collection('transactions').findOne({ id: transactionId })
+    const txType = (tx?.transaction_type || 'sale').toLowerCase()
+    const isBuyer = txType === 'purchase'
+    const stagesInOrder = isBuyer
+      ? ['pre_approval','home_search','offer','under_contract','escrow_closing']
+      : ['pre_listing','listing','under_contract','escrow_closing']
+
     // Get all checklist items for current stage
     const currentStageItems = await db.collection('checklist_items')
       .find({ 
@@ -550,9 +1236,48 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
         stage: currentStage 
       })
       .toArray()
+    // completeness for validation is computed below using parent/child relationships
+    // (avoid premature lists here to prevent variable redeclaration)
 
-    const incompleteItems = currentStageItems.filter(item => item.status !== 'completed')
-    const blockedItems = currentStageItems.filter(item => item.status === 'blocked')
+    // Compute effective completeness using normalized parent/child items and consider dependencies
+    const allStageItems = currentStageItems
+    const parents = allStageItems.filter(i => !i.parent_id)
+    const children = allStageItems.filter(i => i.parent_id)
+
+    const childrenByParent = new Map()
+    for (const c of children) {
+      if (!childrenByParent.has(c.parent_id)) childrenByParent.set(c.parent_id, [])
+      childrenByParent.get(c.parent_id).push(c)
+    }
+
+    const isCompleted = (it) => it.status === 'completed'
+    const parentEffectiveComplete = new Map()
+    for (const p of parents) {
+      const kids = childrenByParent.get(p.id) || []
+      const complete = kids.length > 0 ? kids.every(isCompleted) : isCompleted(p)
+      parentEffectiveComplete.set(p.id, complete)
+    }
+
+    const completedIdSet = new Set([
+      ...children.filter(isCompleted).map(i => i.id),
+      ...parents.filter(p => parentEffectiveComplete.get(p.id)).map(p => p.id)
+    ])
+
+    // Items considered incomplete for validation: incomplete parents (effective) and any incomplete children
+    const incompleteParents = parents.filter(p => !parentEffectiveComplete.get(p.id))
+    const incompleteChildren = children.filter(c => !isCompleted(c))
+    const incompleteItems = [...incompleteParents, ...incompleteChildren]
+    const blockedItems = allStageItems.filter(item => item.status === 'blocked')
+
+    // Check unmet dependencies (for both parents and children)
+    const unmetDependencyItems = []
+    for (const it of allStageItems) {
+      const deps = Array.isArray(it.dependencies) ? it.dependencies : []
+      const unmet = deps.filter(did => !completedIdSet.has(did))
+      if (unmet.length > 0) {
+        unmetDependencyItems.push({ id: it.id, title: it.title, unmet_count: unmet.length })
+      }
+    }
 
     // Use o1-mini for intelligent validation
     const validationMessages = [
@@ -560,14 +1285,12 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
         role: "system",
         content: `You are a real estate transaction expert. Analyze stage transitions for completeness and compliance.
 
+        Transaction type: ${isBuyer ? 'purchase (buyer)' : 'sale (seller)'}
         Current stage: ${currentStage}
         Target stage: ${targetStage}
         
-        Stages in order:
-        1. pre_listing - Property preparation, pricing, marketing setup
-        2. listing - Active marketing, showings, offers
-        3. under_contract - Inspections, appraisal, financing
-        4. escrow_closing - Title work, final walkthrough, closing
+        Stages in order for this flow:
+        ${stagesInOrder.map((s, i) => `${i+1}. ${s}`).join('\n')}
         
         Rules:
         - All critical tasks must be completed before advancing
@@ -591,10 +1314,13 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
         content: `Validate transition from "${currentStage}" to "${targetStage}".
         
         Incomplete items (${incompleteItems.length}):
-        ${incompleteItems.map(item => `- ${item.title} (${item.priority} priority, status: ${item.status})`).join('\n')}
+        ${incompleteItems.map(item => `- ${item.title} (${item.priority || 'medium'} priority, status: ${item.status}${item.parent_id ? ', subtask' : ''})`).join('\n')}
         
         Blocked items (${blockedItems.length}):
         ${blockedItems.map(item => `- ${item.title} (blocked: ${item.notes})`).join('\n')}
+
+        Items with unmet dependencies (${unmetDependencyItems.length}):
+        ${unmetDependencyItems.map(x => `- ${x.title} (${x.unmet_count} unmet)`).join('\n')}
         
         Force override requested: ${force}
         
@@ -608,20 +1334,27 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
     try {
       validationResult = JSON.parse(validationResponse)
     } catch (parseError) {
-      // Fallback validation logic
+      // Fallback validation logic including stage order enforcement and dependency checks
+      const curIdx = stagesInOrder.indexOf(currentStage)
+      const tgtIdx = stagesInOrder.indexOf(targetStage)
+      const inOrder = curIdx !== -1 && tgtIdx !== -1 && tgtIdx <= curIdx + 1 && tgtIdx >= curIdx
       validationResult = {
-        valid: incompleteItems.length === 0 && blockedItems.length === 0,
+        valid: inOrder && incompleteItems.length === 0 && blockedItems.length === 0 && unmetDependencyItems.length === 0,
         confidence: 70,
-        errors: incompleteItems.length > 0 ? [`${incompleteItems.length} incomplete tasks`] : [],
+        errors: [
+          ...(inOrder ? [] : ["Invalid stage order for this transaction type"]),
+          ...(incompleteItems.length > 0 ? [`${incompleteItems.length} incomplete tasks`] : []),
+          ...(unmetDependencyItems.length > 0 ? [`${unmetDependencyItems.length} items with unmet dependencies`] : [])
+        ],
         warnings: blockedItems.length > 0 ? [`${blockedItems.length} blocked tasks`] : [],
         missing_critical: incompleteItems.filter(i => i.priority === 'high' || i.priority === 'urgent').map(i => i.title),
-        can_proceed_with_warnings: incompleteItems.filter(i => i.priority === 'high' || i.priority === 'urgent').length === 0,
+        can_proceed_with_warnings: inOrder && incompleteItems.filter(i => i.priority === 'high' || i.priority === 'urgent').length === 0 && unmetDependencyItems.length === 0,
         recommendations: ["Complete high-priority tasks before proceeding"]
       }
     }
 
     return {
-      valid: force || validationResult.valid || validationResult.can_proceed_with_warnings,
+      valid: force || (validationResult.valid || validationResult.can_proceed_with_warnings),
       ...validationResult,
       incomplete_count: incompleteItems.length,
       blocked_count: blockedItems.length,
@@ -646,45 +1379,87 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
   }
 }
 
-// Create default checklist items for each stage
-async function createDefaultChecklistItems(db, transactionId, stage) {
-  const defaultTasks = getDefaultTasksForStage(stage)
-  
-  const checklistItems = defaultTasks.map((task, index) => ({
-    id: uuidv4(),
-    transaction_id: transactionId,
-    title: task.title,
-    description: task.description,
-    stage: stage,
-    status: 'not_started',
-    priority: task.priority,
-    assignee: '',
-    due_date: task.due_days ? new Date(Date.now() + task.due_days * 24 * 60 * 60 * 1000) : null,
-    completed_date: null,
-    notes: '',
-    order: index + 1,
-    stage_order: getStageOrder(stage),
-    dependencies: task.dependencies || [],
-    created_at: new Date(),
-    updated_at: new Date()
-  }))
+// Create default checklist items for each stage (aware of transaction type)
+async function createDefaultChecklistItems(db, transactionId, stage, transactionType = 'sale') {
+  const defaultTasks = getDefaultTasksForStage(stage, transactionType)
 
-  if (checklistItems.length > 0) {
-    await db.collection('checklist_items').insertMany(checklistItems)
+  // Normalized model with parent/child docs
+  const itemsToInsert = []
+  defaultTasks.forEach((task, index) => {
+    const parentId = uuidv4()
+    const parentDoc = {
+      id: parentId,
+      transaction_id: transactionId,
+      title: task.title,
+      description: task.description,
+      stage: stage,
+      status: 'not_started',
+      priority: task.priority,
+      assignee: '',
+      due_date: task.due_days ? new Date(Date.now() + task.due_days * 24 * 60 * 60 * 1000) : null,
+      completed_date: null,
+      notes: '',
+      order: index + 1,
+      stage_order: getStageOrder(stage, transactionType),
+      dependencies: task.dependencies || [],
+      weight: typeof task.weight === 'number' ? task.weight : 1,
+      parent_id: null,
+      created_at: new Date(),
+      updated_at: new Date()
+    }
+    itemsToInsert.push(parentDoc)
+
+    const subs = Array.isArray(task.subtasks) ? task.subtasks : []
+    subs.forEach((sub, sIdx) => {
+      const childDoc = {
+        id: uuidv4(),
+        transaction_id: transactionId,
+        title: sub.title,
+        description: sub.description || '',
+        stage: stage,
+        status: 'not_started',
+        priority: sub.priority || task.priority || 'medium',
+        assignee: '',
+        due_date: sub.due_days ? new Date(Date.now() + sub.due_days * 24 * 60 * 60 * 1000) : null,
+        completed_date: null,
+        notes: '',
+        // keep same order as parent for grouping; frontend will nest by parent_id
+        order: index + 1,
+        stage_order: parentDoc.stage_order,
+        dependencies: Array.isArray(sub.dependencies) ? sub.dependencies : [],
+        weight: typeof sub.weight === 'number' ? sub.weight : 1,
+        parent_id: parentId,
+        created_at: new Date(),
+        updated_at: new Date()
+      }
+      itemsToInsert.push(childDoc)
+    })
+  })
+
+  if (itemsToInsert.length > 0) {
+    await db.collection('checklist_items').insertMany(itemsToInsert)
   }
 
-  return checklistItems.map(({ _id, ...rest }) => rest)
+  return itemsToInsert.map(({ _id, ...rest }) => rest)
 }
 
-// Get stage order for sorting
-function getStageOrder(stage) {
-  const stageOrder = {
+// Get stage order for sorting, branching by transaction type
+function getStageOrder(stage, transactionType = 'sale') {
+  const sellerOrder = {
     'pre_listing': 1,
     'listing': 2,
     'under_contract': 3,
     'escrow_closing': 4
   }
-  return stageOrder[stage] || 999
+  const buyerOrder = {
+    'pre_approval': 1,
+    'home_search': 2,
+    'offer': 3,
+    'under_contract': 4,
+    'escrow_closing': 5
+  }
+  const mapping = (transactionType === 'purchase') ? buyerOrder : sellerOrder
+  return mapping[stage] || 999
 }
 
 // Helper function to extract names from messages (fallback parsing)
@@ -875,10 +1650,16 @@ async function getSmartAlerts(db, filters = {}) {
 
     // Generate new alerts if needed
     const newAlerts = await generateSmartAlerts(db)
+    // Apply same filters to freshly generated alerts
+    const filteredNewAlerts = newAlerts.filter(a => (
+      (!filters.agent || a.assigned_agent === filters.agent) &&
+      (!filters.priority || a.priority === filters.priority) &&
+      (!filters.type || a.alert_type === filters.type)
+    ))
 
     // Combine and return all alerts
-    const allAlerts = [...newAlerts, ...existingAlerts.filter(alert => 
-      !newAlerts.find(newAlert => 
+    const allAlerts = [...filteredNewAlerts, ...existingAlerts.filter(alert => 
+      !filteredNewAlerts.find(newAlert => 
         newAlert.transaction_id === alert.transaction_id && 
         newAlert.alert_type === alert.alert_type
       )
@@ -901,7 +1682,6 @@ async function getSmartAlerts(db, filters = {}) {
 
 async function generateSmartAlerts(db) {
   try {
-    const alerts = []
     const now = new Date()
     const threeDaysAgo = new Date(now.getTime() - (3 * 24 * 60 * 60 * 1000))
     const sevenDaysAgo = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000))
@@ -911,8 +1691,10 @@ async function generateSmartAlerts(db) {
       .find({ current_stage: { $ne: 'closed' } })
       .toArray()
 
+    // Build candidate alerts based on current state
+    const candidates = []
     for (const transaction of transactions) {
-      // Check for overdue tasks (> 3 days)
+      // Overdue tasks (> 3 days)
       const overdueTasks = await db.collection('checklist_items')
         .find({
           transaction_id: transaction.id,
@@ -922,9 +1704,7 @@ async function generateSmartAlerts(db) {
         .toArray()
 
       if (overdueTasks.length > 0) {
-        const alertId = uuidv4()
-        const overdueAlert = {
-          id: alertId,
+        candidates.push({
           alert_type: 'overdue_tasks',
           priority: overdueTasks.some(task => task.priority === 'urgent') ? 'urgent' : 'high',
           transaction_id: transaction.id,
@@ -942,18 +1722,13 @@ async function generateSmartAlerts(db) {
               priority: task.priority,
               days_overdue: Math.ceil((now - new Date(task.due_date)) / (1000 * 60 * 60 * 24))
             }))
-          },
-          created_at: now,
-          status: 'active'
-        }
-        alerts.push(overdueAlert)
+          }
+        })
       }
 
-      // Check for deal inactivity (> 7 days)
+      // Deal inactivity (> 7 days)
       if (new Date(transaction.updated_at) < sevenDaysAgo) {
-        const alertId = uuidv4()
-        const inactivityAlert = {
-          id: alertId,
+        candidates.push({
           alert_type: 'deal_inactivity',
           priority: 'medium',
           transaction_id: transaction.id,
@@ -966,31 +1741,24 @@ async function generateSmartAlerts(db) {
             days_inactive: Math.ceil((now - new Date(transaction.updated_at)) / (1000 * 60 * 60 * 24)),
             current_stage: transaction.current_stage,
             last_update: transaction.updated_at
-          },
-          created_at: now,
-          status: 'active'
-        }
-        alerts.push(inactivityAlert)
+          }
+        })
       }
 
-      // Check for approaching closing dates
+      // Approaching closing date (<= 7 days)
       if (transaction.closing_date) {
         const closingDate = new Date(transaction.closing_date)
         const daysToClosing = Math.ceil((closingDate - now) / (1000 * 60 * 60 * 24))
-        
         if (daysToClosing <= 7 && daysToClosing > 0) {
           const currentStageItems = await db.collection('checklist_items')
-            .find({ 
+            .find({
               transaction_id: transaction.id,
               stage: transaction.current_stage,
               status: { $ne: 'completed' }
             })
             .toArray()
-
           if (currentStageItems.length > 0) {
-            const alertId = uuidv4()
-            const closingAlert = {
-              id: alertId,
+            candidates.push({
               alert_type: 'closing_approaching',
               priority: daysToClosing <= 3 ? 'urgent' : 'high',
               transaction_id: transaction.id,
@@ -1004,77 +1772,146 @@ async function generateSmartAlerts(db) {
                 closing_date: transaction.closing_date,
                 incomplete_tasks: currentStageItems.length,
                 current_stage: transaction.current_stage
-              },
-              created_at: now,
-              status: 'active'
-            }
-            alerts.push(closingAlert)
+              }
+            })
           }
         }
       }
     }
 
-    // Save new alerts to database
-    if (alerts.length > 0) {
-      await db.collection('smart_alerts').insertMany(alerts)
+    // Upsert alerts per (transaction_id, alert_type), preserve dismissed status
+    const collection = db.collection('smart_alerts')
+    const upserted = []
+    for (const cand of candidates) {
+      const existing = await collection.findOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type })
+      if (existing) {
+        const keepDismissed = existing.status === 'dismissed'
+        const updateFields = {
+          // Ensure all core fields are current
+          priority: cand.priority,
+          property_address: cand.property_address,
+          client_name: cand.client_name,
+          assigned_agent: cand.assigned_agent,
+          title: cand.title,
+          message: cand.message,
+          details: cand.details,
+          updated_at: now
+        }
+        // Backfill missing custom id for legacy docs
+        if (!existing.id) updateFields.id = uuidv4()
+        // Only set status to active if it wasn't dismissed
+        if (!keepDismissed) updateFields.status = 'active'
+        // Update by unique key (transaction_id, alert_type) to handle legacy docs without id
+        await collection.updateOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type }, { $set: updateFields })
+        const doc = await collection.findOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type })
+        if (doc && doc.status !== 'dismissed') {
+          const { _id, ...rest } = doc
+          upserted.push(rest)
+        }
+      } else {
+        const doc = {
+          id: uuidv4(),
+          alert_type: cand.alert_type,
+          priority: cand.priority,
+          transaction_id: cand.transaction_id,
+          property_address: cand.property_address,
+          client_name: cand.client_name,
+          assigned_agent: cand.assigned_agent,
+          title: cand.title,
+          message: cand.message,
+          details: cand.details,
+          created_at: now,
+          updated_at: now,
+          status: 'active'
+        }
+        await collection.insertOne(doc)
+        const { _id, ...rest } = doc
+        upserted.push(rest)
+      }
     }
 
-    return alerts.map(({ _id, ...rest }) => rest)
+    return upserted
   } catch (error) {
     console.error('Smart alerts generation error:', error)
     return []
   }
 }
-function getDefaultTasksForStage(stage) {
-  const taskTemplates = {
+
+function getDefaultTasksForStage(stage, transactionType = 'sale') {
+  // Seller (listing) flow tasks
+  const sellerTasks = {
     'pre_listing': [
       {
         title: 'Property Condition Assessment',
         description: 'Conduct thorough walkthrough to identify needed repairs and improvements',
         priority: 'high',
-        due_days: 3
+        due_days: 3,
+        weight: 2,
+        subtasks: [
+          { title: 'Schedule walkthrough', weight: 1 },
+          { title: 'Document issues & photos', weight: 1 }
+        ]
       },
       {
         title: 'Comparative Market Analysis (CMA)',
         description: 'Research comparable sales, active listings, and market trends',
         priority: 'high',
-        due_days: 5
+        due_days: 5,
+        weight: 1
       },
       {
         title: 'Pricing Strategy Development',
         description: 'Set competitive listing price based on CMA and market conditions',
         priority: 'high',
-        due_days: 7
+        due_days: 7,
+        weight: 1
       },
       {
         title: 'Home Staging Consultation',
         description: 'Evaluate staging needs and arrange professional staging if needed',
         priority: 'medium',
-        due_days: 10
+        due_days: 10,
+        weight: 1,
+        subtasks: [
+          { title: 'Hire stager', weight: 1 },
+          { title: 'Staging day scheduled', weight: 1 }
+        ]
       },
       {
         title: 'Professional Photography Scheduling',
         description: 'Book professional photographer for listing photos',
         priority: 'high',
-        due_days: 12
+        due_days: 12,
+        weight: 1,
+        subtasks: [
+          { title: 'Select photographer', weight: 0.5 },
+          { title: 'Photoshoot completed', weight: 0.5 }
+        ]
       },
       {
         title: 'Marketing Materials Preparation',
         description: 'Create flyers, brochures, and property feature sheets',
         priority: 'medium',
-        due_days: 14
+        due_days: 14,
+        weight: 1
       },
       {
         title: 'Pre-Listing Inspections',
         description: 'Schedule home, pest, and other recommended inspections',
         priority: 'medium',
-        due_days: 14
+        due_days: 14,
+        weight: 1,
+        subtasks: [
+          { title: 'Home inspection', weight: 0.5 },
+          { title: 'Pest inspection', weight: 0.5 }
+        ]
       },
       {
         title: 'Listing Agreement Execution',
         description: 'Sign listing agreement and review all terms with seller',
         priority: 'urgent',
-        due_days: 1
+        due_days: 1,
+        weight: 1
       }
     ],
     'listing': [
@@ -1082,13 +1919,15 @@ function getDefaultTasksForStage(stage) {
         title: 'MLS Entry and Syndication',
         description: 'Enter property details in MLS and syndicate to major real estate websites',
         priority: 'urgent',
-        due_days: 1
+        due_days: 1,
+        weight: 1
       },
       {
         title: 'Listing Photos Upload',
         description: 'Upload high-quality photos to MLS and marketing platforms',
         priority: 'high',
-        due_days: 1
+        due_days: 1,
+        weight: 1
       },
       {
         title: 'Property Description Optimization',
@@ -1132,19 +1971,30 @@ function getDefaultTasksForStage(stage) {
         title: 'Purchase Agreement Review',
         description: 'Review all contract terms and conditions with client',
         priority: 'urgent',
-        due_days: 1
+        due_days: 1,
+        weight: 2,
+        subtasks: [
+          { title: 'Confirm contingencies', weight: 1 },
+          { title: 'Review timelines', weight: 1 }
+        ]
       },
       {
         title: 'Earnest Money Deposit',
         description: 'Collect and deposit earnest money per contract terms',
         priority: 'urgent',
-        due_days: 2
+        due_days: 2,
+        weight: 1
       },
       {
         title: 'Home Inspection Coordination',
         description: 'Schedule home inspection and coordinate access',
         priority: 'high',
-        due_days: 7
+        due_days: 7,
+        weight: 1,
+        subtasks: [
+          { title: 'Schedule inspector', weight: 0.5 },
+          { title: 'Distribute report', weight: 0.5 }
+        ]
       },
       {
         title: 'Appraisal Scheduling',
@@ -1229,10 +2079,66 @@ function getDefaultTasksForStage(stage) {
     ]
   }
 
-  return taskTemplates[stage] || []
+  // Buyer (purchase) flow tasks
+  const buyerTasks = {
+    'pre_approval': [
+      { title: 'Lender Introduction', description: 'Connect client with preferred lenders to start pre-approval', priority: 'high', due_days: 2 },
+      { title: 'Collect Financial Docs', description: 'Gather pay stubs, W-2s, bank statements for lender', priority: 'high', due_days: 5 },
+      { title: 'Pre-Approval Letter', description: 'Obtain pre-approval letter with target price range and loan program', priority: 'urgent', due_days: 7 }
+    ],
+    'home_search': [
+      { title: 'Define Search Criteria', description: 'Clarify location, beds/baths, budget, must-haves and nice-to-haves', priority: 'high', due_days: 2 },
+      { title: 'Auto-Search Setup', description: 'Set up MLS/autosearch alerts matching buyer preferences', priority: 'medium', due_days: 2 },
+      { title: 'Schedule Showings', description: 'Organize tours for top candidate properties', priority: 'medium', due_days: 7 }
+    ],
+    'offer': [
+      { title: 'Offer Strategy', description: 'Discuss comps, contingencies, timelines, and negotiation plan', priority: 'high', due_days: 1 },
+      { title: 'Draft Offer', description: 'Prepare purchase contract and required disclosures', priority: 'urgent', due_days: 1 },
+      { title: 'Submit Offer', description: 'Submit offer and confirm receipt with listing agent', priority: 'urgent', due_days: 1 }
+    ],
+    'under_contract': [
+      { title: 'Earnest Money Deposit', description: 'Deliver EMD per contract terms', priority: 'urgent', due_days: 2 },
+      { title: 'Inspection Scheduling', description: 'Coordinate inspections and review findings', priority: 'high', due_days: 7 },
+      { title: 'Appraisal Ordered', description: 'Confirm appraisal is ordered and scheduled', priority: 'high', due_days: 10 },
+      { title: 'Loan Processing', description: 'Monitor underwriting and provide any additional docs', priority: 'high', due_days: 14 }
+    ],
+    'escrow_closing': [
+      { title: 'Title Review', description: 'Review title commitment and address issues', priority: 'high', due_days: 3 },
+      { title: 'Closing Disclosure Review', description: 'Review CD with buyer and verify figures', priority: 'high', due_days: 5 },
+      { title: 'Final Walk-through', description: 'Confirm property condition prior to close', priority: 'medium', due_days: 1 },
+      { title: 'Closing Logistics', description: 'Coordinate signing, funds, and key handoff', priority: 'urgent', due_days: 0 }
+    ]
+  }
+
+  const templates = transactionType === 'purchase' ? buyerTasks : sellerTasks
+  return templates[stage] || []
 }
+
 function generateFallbackProperties(filters = {}) {
   const mockProperties = [
+    {
+      id: 'prop_ca_1',
+      address: '123 Bay Street',
+      city: 'San Francisco',
+      state: 'CA',
+      zipcode: '94121',
+      price: 750000,
+      bedrooms: 3,
+      bathrooms: 2,
+      square_feet: 1800,
+      property_type: 'Single Family',
+      listing_status: 'for_sale',
+      description: 'Charming single-family home near Golden Gate Park.',
+      images: [],
+      listing_date: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+      days_on_market: 10,
+      mls_number: 'MLS999001',
+      lot_size: '0.08',
+      year_built: 1990,
+      garage: 1,
+      pool: false,
+      fireplace: true
+    },
     {
       id: 'mock_1',
       address: '123 Main Street',
@@ -1320,6 +2226,16 @@ function generateFallbackProperties(filters = {}) {
     filteredProperties = filteredProperties.filter(p => p.bathrooms >= parseInt(filters.baths))
   }
   if (filters.location) {
+    // Normalize location search
+    const loc = filters.location.toLowerCase()
+    // Map of US states full name -> abbreviation
+    const stateMap = {
+      'alabama':'al','alaska':'ak','arizona':'az','arkansas':'ar',
+      'california':'ca','colorado':'co','connecticut':'ct','delaware':'de','district of columbia':'dc',
+      'florida':'fl','georgia':'ga','hawaii':'hi','idaho':'id','illinois':'il','indiana':'in','iowa':'ia','kansas':'ks','kentucky':'ky','louisiana':'la','maine':'me','maryland':'md','massachusetts':'ma','michigan':'mi','minnesota':'mn','mississippi':'ms','missouri':'mo','montana':'mt','nebraska':'ne','nevada':'nv','new hampshire':'nh','new jersey':'nj','new mexico':'nm','new york':'ny','north carolina':'nc','north dakota':'nd','ohio':'oh','oklahoma':'ok','oregon':'or','pennsylvania':'pa','rhode island':'ri','south carolina':'sc','south dakota':'sd','tennessee':'tn','texas':'tx','utah':'ut','vermont':'vt','virginia':'va','washington':'wa','west virginia':'wv','wisconsin':'wi','wyoming':'wy'
+    }
+    const locAbbr = stateMap[loc] || loc
+
     const location = filters.location.toLowerCase()
     filteredProperties = filteredProperties.filter(p => 
       p.city.toLowerCase().includes(location) || 
@@ -1357,27 +2273,130 @@ async function checkDuplicateLead(db, email, phone) {
   return existingLead
 }
 
-// AI Lead Insights
 async function generateLeadInsights(lead, properties = []) {
+  const leadType = String(lead?.lead_type || '').toLowerCase()
+
+  // Seller: provide valuation/pricing/listing-prep insights. Do NOT fetch listings.
+  if (leadType === 'seller') {
+    const prefs = lead?.preferences || {}
+    const sellerAddress = prefs.seller_address || prefs.address || null
+    const sellerPrice = prefs.seller_price ?? prefs.asking_price ?? null
+    // Normalize seller detail fields so the AI has explicit structured facts
+    const sellerDetails = {
+      address: sellerAddress || null,
+      asking_price: sellerPrice,
+      property_type: prefs.seller_property_type ?? prefs.property_type ?? null,
+      bedrooms: prefs.seller_bedrooms ?? prefs.bedrooms ?? null,
+      bathrooms: prefs.seller_bathrooms ?? prefs.bathrooms ?? null,
+      year_built: prefs.seller_year_built ?? prefs.year_built ?? null,
+      square_feet: prefs.seller_square_feet ?? prefs.square_feet ?? null,
+      lot_size: prefs.seller_lot_size ?? prefs.lot_size ?? null,
+      condition: prefs.seller_condition ?? prefs.condition ?? null,
+      occupancy: prefs.seller_occupancy ?? prefs.occupancy ?? null,
+      timeline_to_list: prefs.seller_timeline ?? prefs.timeline ?? null,
+      hoa_fee_monthly: prefs.seller_hoa_fee ?? prefs.hoa_fee ?? null,
+      notes: prefs.seller_description ?? prefs.notes ?? null,
+      zipcode: prefs.zipcode ?? null
+    }
+
+    const messages = [
+      {
+        role: "system",
+        content: "You are a precise real estate listing advisor. For seller leads, provide valuation context, pricing strategy, listing preparation guidance, and next steps. Do NOT recommend purchase listings. Keep it concise and actionable."
+      },
+      {
+        role: "user",
+        content: `Lead: ${lead.name} (seller)
+Seller Details (structured JSON): ${JSON.stringify(sellerDetails)}
+
+Instructions:
+- Treat the Seller Details as ground truth; explicitly incorporate known facts (beds/baths, year, square feet, lot size, condition, occupancy, timeline, HOA fee, notes) into your assumptions and recommendations.
+- Do NOT suggest properties to buy or include property listings.
+- Provide a realistic valuation range with clear assumptions tied to the property's specifics and micro-location. If the address or zipcode is known, reflect that context without fabricating comps.
+- Recommend a pricing strategy (e.g., list slightly below/at/above comps) and expected buyer response, referencing the property's condition, size, and occupancy where relevant.
+- Provide a concise listing prep checklist tailored to the specifics (e.g., if condition is Good, focus on touch-ups; if Vacant, emphasize staging options; if HOA present, note disclosure items).
+- Close with 2-3 concrete next steps for the agent with the seller.
+
+Output (Markdown):
+### AI Insights
+- Valuation Range and Assumptions (reference relevant facts like beds/baths, year, sqft, lot size, condition)
+- Pricing Strategy and Rationale (tie to demand for the given property type/size and occupancy)
+- Listing Preparation Checklist (tailored to the provided details)
+### Next Steps
+- Action 1
+- Action 2
+${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
+      }
+    ]
+
+    return await callOpenAI('gpt-4o-mini', messages)
+  }
+
+  // Buyer (default): use existing property matching logic.
+  // Pull real inventory using lead preferences if properties not provided
+  let fetchedProps = properties
+  try {
+    if (!Array.isArray(fetchedProps) || fetchedProps.length === 0) {
+      const filters = mapLeadPreferencesToFilters(lead?.preferences || {})
+      const res = await fetchProperties(filters)
+      fetchedProps = res?.properties || []
+
+      // Apply strict filtering to align with constraints
+      const desiredZip = filters.location ? String(filters.location).slice(0, 5) : null
+      const minBeds = filters.beds ? Number(filters.beds) : null
+      const minBaths = filters.baths ? Number(filters.baths) : null
+      const minPrice = filters.min_price ? Number(filters.min_price) : null
+      const maxPrice = filters.max_price ? Number(filters.max_price) : null
+
+      fetchedProps = fetchedProps.filter(p => {
+        if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+        if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
+        if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
+        if (minPrice !== null || maxPrice !== null) {
+          if (typeof p.price !== 'number') return false
+          if (minPrice !== null && p.price < minPrice) return false
+          if (maxPrice !== null && p.price > maxPrice) return false
+        }
+        return true
+      })
+    }
+  } catch (e) {
+    console.warn('generateLeadInsights property fetch/filter failed, continuing with provided properties.', e)
+  }
+
+  const topProps = Array.isArray(fetchedProps) ? fetchedProps.slice(0, 5) : []
+
   const messages = [
     {
       role: "system",
-      content: "You are a real estate AI assistant. Analyze the lead information and provide insights about their preferences, potential matches, and recommendations."
+      content: "You are a precise real estate matching expert. Only recommend properties that satisfy the lead's stated constraints. If none satisfy, say so and suggest adjustments."
     },
     {
       role: "user",
-      content: `Analyze this lead:
-      Name: ${lead.name}
-      Type: ${lead.lead_type}
+      content: `Lead: ${lead.name} (${lead.lead_type})
       Preferences: ${JSON.stringify(lead.preferences)}
-      Tags: ${lead.tags?.join(', ') || 'None'}
-      
-      Available properties: ${properties.length} found
-      
-      Provide brief insights and recommendations for this lead.`
+      Candidate Properties (up to 5): ${JSON.stringify(topProps)}
+
+      Rules:
+      - Only select properties that meet min bedrooms, min bathrooms, and price range when these are provided.
+      - If zipcode is specified, only consider that zipcode.
+      - Do not include properties with unknown values for required constraints.
+      - If no properties meet constraints, clearly state none match and propose specific, practical adjustments.
+
+      Output (Markdown):
+      ### AI Insights
+      1) For each of the top 3 matches, show:
+         - Address
+         - Price (USD, commas)
+         - Bedrooms / Bathrooms
+         - Reason for Match (explicitly reference how it meets the constraints)
+      ### Summary
+      - Brief recap of how matches satisfy the constraints.
+      ### Next Steps
+      - 2-3 concise actions for the agent.`
     }
   ]
-  
+
   return await callOpenAI('gpt-4o-mini', messages)
 }
 
@@ -1555,30 +2574,194 @@ async function handleRoute(request, { params }) {
         ))
       }
 
-      // Search properties based on lead preferences
-      const properties = await searchProperties(lead.preferences)
+      // If lead is a seller, skip property search and produce seller-focused insights
+      const leadTypeForMatch = String(lead?.lead_type || '').toLowerCase()
+      if (leadTypeForMatch === 'seller') {
+        // Enrich seller preferences from transaction info if available
+        const prefs = lead.preferences || {}
+        const tx = lead.transaction_info || {}
+        const enrichedPrefs = { ...prefs }
+        if (!enrichedPrefs.seller_address && tx.property_address) {
+          enrichedPrefs.seller_address = tx.property_address
+        }
+        if (enrichedPrefs.seller_price == null) {
+          const txPrice = tx.listing_price ?? tx.asking_price ?? tx.price ?? null
+          if (txPrice != null) enrichedPrefs.seller_price = txPrice
+        }
+        // Persist preference enrichment if changed
+        try {
+          if (JSON.stringify(enrichedPrefs) !== JSON.stringify(prefs)) {
+            await db.collection('leads').updateOne(
+              { id: leadId },
+              { $set: { preferences: enrichedPrefs, updated_at: new Date() } }
+            )
+          }
+        } catch (e) {
+          console.warn('Failed to enrich seller preferences for lead', leadId, e)
+        }
+        const sellerLead = { ...lead, preferences: enrichedPrefs }
+        // Generate seller-specific insights (no property suggestions)
+        const insights = await generateLeadInsights(sellerLead, [])
+        // Persist insights
+        try {
+          await db.collection('leads').updateOne(
+            { id: leadId },
+            { $set: { ai_insights: insights, last_matched_at: new Date(), updated_at: new Date() } }
+          )
+        } catch (e) {
+          console.warn('Failed to persist ai_insights for seller lead', leadId, e)
+        }
+        const updatedSellerLead = await db.collection('leads').findOne({ id: leadId })
+        const { _id: _omit, ...cleanedSellerLead } = updatedSellerLead || {}
+        return handleCORS(NextResponse.json({
+          lead_id: leadId,
+          properties: [],
+          ai_recommendations: insights,
+          total_found: 0,
+          filters_applied: {},
+          filter_policy: 'seller_no_search',
+          updated_lead: cleanedSellerLead
+        }))
+      }
+
+      // Search properties based on lead preferences (strict mapping)
+      const filters = mapLeadPreferencesToFilters(lead.preferences || {})
+      const propertySearchResult = await fetchProperties(filters)
+      const properties = propertySearchResult?.properties || []
+
+      // Apply strict, preference-aligned filtering so AI only sees valid candidates
+      const desiredZip = filters.location ? String(filters.location).slice(0, 5) : null
+      const minBeds = filters.beds ? Number(filters.beds) : null
+      const minBaths = filters.baths ? Number(filters.baths) : null
+      const minPrice = filters.min_price ? Number(filters.min_price) : null
+      const maxPrice = filters.max_price ? Number(filters.max_price) : null
+
+      function filterStrict(list) {
+        return list.filter(p => {
+          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
+          if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
+          if (minPrice !== null || maxPrice !== null) {
+            if (typeof p.price !== 'number') return false
+            if (minPrice !== null && p.price < minPrice) return false
+            if (maxPrice !== null && p.price > maxPrice) return false
+          }
+          return true
+        })
+      }
+
+      // Progressive relaxation in case of zero strict matches
+      let matchingPool = filterStrict(properties)
+      let filterPolicy = 'strict'
+
+      if (matchingPool.length === 0) {
+        // Allow unknown baths
+        matchingPool = properties.filter(p => {
+          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
+          if (minPrice !== null || maxPrice !== null) {
+            if (typeof p.price !== 'number') return false
+            if (minPrice !== null && p.price < minPrice) return false
+            if (maxPrice !== null && p.price > maxPrice) return false
+          }
+          return true
+        })
+        if (matchingPool.length > 0) filterPolicy = 'relaxed:allow_unknown_baths'
+      }
+
+      if (matchingPool.length === 0) {
+        // Allow unknown beds too
+        matchingPool = properties.filter(p => {
+          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
+          if (minPrice !== null || maxPrice !== null) {
+            if (typeof p.price !== 'number') return false
+            if (minPrice !== null && p.price < minPrice) return false
+            if (maxPrice !== null && p.price > maxPrice) return false
+          }
+          return true
+        })
+        if (matchingPool.length > 0) filterPolicy = 'relaxed:allow_unknown_beds_baths'
+      }
+
+      if (matchingPool.length === 0 && (minPrice !== null || maxPrice !== null)) {
+        // Expand price by ±10%
+        const adjMin = minPrice !== null ? Math.floor(minPrice * 0.9) : null
+        const adjMax = maxPrice !== null ? Math.ceil(maxPrice * 1.1) : null
+        matchingPool = properties.filter(p => {
+          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (minBeds !== null && typeof p.bedrooms === 'number' && p.bedrooms < minBeds) return false
+          if (minBaths !== null && typeof p.bathrooms === 'number' && p.bathrooms < minBaths) return false
+          if (typeof p.price !== 'number') return false
+          if (adjMin !== null && p.price < adjMin) return false
+          if (adjMax !== null && p.price > adjMax) return false
+          return true
+        })
+        if (matchingPool.length > 0) filterPolicy = 'relaxed:price_10pct'
+      }
+
+      // Final fallback to original list to avoid empty UX (AI will explicitly state mismatch)
+      if (matchingPool.length === 0) {
+        matchingPool = properties
+        filterPolicy = 'fallback:unfiltered'
+      }
       
       // Generate AI matching insights
       const matchingInsights = await callOpenAI('o1-mini', [
         {
           role: "system",
-          content: "You are a real estate matching expert. Analyze the lead's preferences and the available properties to provide personalized recommendations."
+          content: "You are a precise real estate matching expert. Only recommend properties that satisfy the lead's stated constraints. If none satisfy, say so and suggest adjustments."
         },
         {
           role: "user",
           content: `Lead: ${lead.name} (${lead.lead_type})
           Preferences: ${JSON.stringify(lead.preferences)}
-          Available Properties: ${JSON.stringify(properties.slice(0, 5))}
-          
-          Provide top 3 property matches with reasons why each property suits this lead.`
+          Applied Filters (strict): ${JSON.stringify(filters)}
+          Candidate Properties (post-filter, up to 5): ${JSON.stringify(matchingPool.slice(0, 5))}
+          Filter Policy Used: ${filterPolicy}
+
+          Rules:
+          - Only select properties that meet min bedrooms, min bathrooms, and price range when these are provided.
+          - If zipcode is specified, only consider that zipcode.
+          - Do not include properties with unknown values for required constraints.
+          - If no properties meet constraints, clearly state none match and propose specific, practical adjustments.
+
+          Output (Markdown):
+          ### AI Insights
+          1) For each of the top 3 matches, show:
+             - Address
+             - Price (USD, commas)
+             - Bedrooms / Bathrooms
+             - Reason for Match (explicitly reference how it meets the constraints)
+          ### Summary
+          - Brief recap of how matches satisfy the constraints. If Filter Policy is not 'strict', briefly note what was relaxed.
+          ### Next Steps
+          - 2-3 concise actions for the agent.`
         }
       ])
 
+      // Persist AI insights on the lead for display in UI
+      try {
+        await db.collection('leads').updateOne(
+          { id: leadId },
+          { $set: { ai_insights: matchingInsights, updated_at: new Date(), last_matched_at: new Date() } }
+        )
+      } catch (e) {
+        console.warn('Failed to persist ai_insights for lead', leadId, e)
+      }
+
+      // Fetch updated lead without _id
+      const updatedLeadDoc = await db.collection('leads').findOne({ id: leadId })
+      const { _id: _throwaway, ...cleanedUpdatedLead } = updatedLeadDoc || {}
+
       return handleCORS(NextResponse.json({
         lead_id: leadId,
-        properties: properties.slice(0, 10),
+        properties: matchingPool.slice(0, 10),
         ai_recommendations: matchingInsights,
-        total_found: properties.length
+        total_found: properties.length,
+        filters_applied: filters,
+        filter_policy: filterPolicy,
+        updated_lead: cleanedUpdatedLead
       }))
     }
 
@@ -1596,8 +2779,11 @@ async function handleRoute(request, { params }) {
         listing_status: url.searchParams.get('listing_status') || 'for_sale',
         property_type: url.searchParams.get('property_type'),
         sort_by: url.searchParams.get('sort_by'),
-        limit: parseInt(url.searchParams.get('limit')) || 20,
-        offset: parseInt(url.searchParams.get('offset')) || 0
+        limit: parseInt(url.searchParams.get('limit')) || 60,
+        offset: parseInt(url.searchParams.get('offset')) || 0,
+        // debug passthrough
+        debug: url.searchParams.get('debug') === '1' || url.searchParams.get('debug') === 'true',
+        include_raw: url.searchParams.get('include_raw') === '1' || url.searchParams.get('include_raw') === 'true'
       }
       
       // Remove null/undefined values
@@ -1629,8 +2815,11 @@ async function handleRoute(request, { params }) {
         listing_status: body.listing_status || 'for_sale',
         property_type: body.property_type,
         sort_by: body.sort_by || 'price_asc',
-        limit: body.limit || 20,
-        offset: body.offset || 0
+        limit: body.limit || 60,
+        offset: body.offset || 0,
+        // debug passthrough
+        debug: !!body.debug,
+        include_raw: !!body.include_raw
       }
       
       const result = await fetchProperties(filters)
@@ -1724,25 +2913,35 @@ async function handleRoute(request, { params }) {
         const messages = [
           {
             role: "system",
-            content: `You are a real estate assistant that extracts structured information from agent messages. 
+            content: `You are a real estate assistant that extracts structured information from agent messages.
             
             Extract the following information from the agent's message and return it as JSON:
             {
               "lead_info": {
                 "name": "extracted name or null",
-                "phone": "extracted phone or null", 
+                "phone": "extracted phone or null",
                 "email": "extracted email or null",
                 "lead_type": "buyer or seller (inferred from context)"
               },
               "preferences": {
                 "zipcode": "extracted zipcode/area or null",
+                "city": "extracted city or null",
+                "state": "2-letter state code if present or null",
                 "min_price": "minimum price or null",
-                "max_price": "maximum price or null", 
+                "max_price": "maximum price or null",
                 "bedrooms": "number of bedrooms or null",
                 "bathrooms": "number of bathrooms or null",
                 "property_type": "extracted property type or null"
               },
-              "intent": "what the agent wants to do (find properties, create lead, etc)",
+              "transaction_info": {
+                "property_address": "full address if provided or null",
+                "transaction_type": "purchase | sale | lease | null",
+                "price": "numeric price if stated (e.g. 500000) or null",
+                "listing_price": "if explicitly a listing price, else null",
+                "contract_price": "if explicitly a contract price, else null",
+                "closing_date": "ISO date string if a closing date is mentioned, else null"
+              },
+              "intent": "one of: find_properties | create_lead | update_preferences | create_transaction | other",
               "summary": "brief summary of the request"
             }
             
@@ -1751,6 +2950,12 @@ async function handleRoute(request, { params }) {
             - Convert "under $500K" to max_price: "500000"
             - Convert "above $300K" to min_price: "300000"
             - Extract city/area names and map to zipcodes if possible (Frisco->75034, Dallas->75201, etc)
+            
+            For transaction extraction:
+            - Map phrases like "open a deal", "start a transaction", "create a transaction" to intent: "create_transaction"
+            - Prefer a full street address for property_address if present; otherwise leave null
+            - If lead_type is buyer and only one price is mentioned, map it to contract_price; if seller, map to listing_price
+            - Parse closing dates (e.g., "Nov 1", "11/01", "in 30 days") to an ISO date string when possible
             
             Return only valid JSON, no other text.`
           },
@@ -1765,180 +2970,517 @@ async function handleRoute(request, { params }) {
         if (!response) {
           throw new Error('No response from OpenAI')
         }
-
-        // Parse the JSON response with better error handling
-        let parsedData
+        
+        // Parse model response to JSON and return
+        let parsed
         try {
-          parsedData = JSON.parse(response.trim())
-        } catch (parseError) {
-          console.error('JSON parse error in assistant/parse:', parseError)
-          console.error('OpenAI response:', response)
-          
-          // Fallback parsing - extract what we can
-          parsedData = {
-            lead_info: {
-              name: extractNameFromMessage(body.message),
-              phone: null,
-              email: null,
-              lead_type: "buyer"
-            },
-            preferences: {
-              zipcode: null,
-              min_price: null,
-              max_price: null,
-              bedrooms: null,
-              bathrooms: null,
-              property_type: null
-            },
-            intent: "unknown",
-            summary: body.message
-          }
+          parsed = JSON.parse(response)
+        } catch (parseErr) {
+          console.error('Assistant parse JSON error:', parseErr, 'Raw:', response)
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: 'Could not parse AI response',
+            raw: response
+          }, { status: 502 }))
         }
-        
-        return handleCORS(NextResponse.json({
-          success: true,
-          parsed_data: parsedData,
-          original_message: body.message
-        }))
-        
+
+        return handleCORS(NextResponse.json({ success: true, parsed_data: parsed }))
       } catch (error) {
-        console.error('Assistant parsing error:', error)
+        console.error('Assistant parse error:', error)
         return handleCORS(NextResponse.json({
           success: false,
-          error: "Failed to parse message",
-          fallback_data: {
-            lead_info: { name: null, phone: null, email: null, lead_type: "buyer" },
-            preferences: {},
-            intent: "unknown",
-            summary: body.message
-          }
+          error: 'Failed to parse message',
+          details: error.message
         }, { status: 500 }))
       }
     }
 
-    // POST /api/assistant/match - Find/create lead and match properties
+    // POST /api/assistant/match - Match lead, search properties, optionally create transaction
     if (route === '/assistant/match' && method === 'POST') {
-      const body = await request.json()
-      
-      if (!body.parsed_data) {
-        return handleCORS(NextResponse.json(
-          { error: "Parsed data is required" }, 
-          { status: 400 }
-        ))
-      }
-
       try {
-        const { lead_info, preferences, intent, summary } = body.parsed_data
+        const body = await request.json()
+        let { parsed_data, original_message, agent_name } = body
+
+        // Allow flexible inputs from frontend: query/text/message/original_message
+        let query = (body.query || body.text || body.message || original_message || '').toString()
+        if (!original_message && query) original_message = query
+
+        // Backward compatibility: if parsed_data missing, invoke the heavy parser internally
+        if (!parsed_data && query) {
+          try {
+            const parseRes = await handleRoute(
+              new Request(request.url, {
+                method: 'POST',
+                body: JSON.stringify({ message: query }),
+                headers: { 'content-type': 'application/json' }
+              }),
+              { params: { path: ['assistant', 'parse'] } }
+            )
+            const parsedJson = await parseRes.json()
+            if (parsedJson?.success && parsedJson.parsed_data) {
+              parsed_data = parsedJson.parsed_data
+            } else if (parsedJson?.parsed_data) {
+              parsed_data = parsedJson.parsed_data
+            }
+          } catch (e) {
+            console.warn('Fallback heavy parse failed:', e)
+          }
+        }
+
+        // If still no parsed_data and also no query, return a gentle success with snapshot guidance
+        if (!parsed_data && !query) {
+          return handleCORS(NextResponse.json({
+            success: true,
+            intent: 'general.suggestions',
+            answer: 'No message provided. Ask me about tasks, alerts, pipeline status, or say: "Just met Priya Sharma. 2BHK in Frisco under $500K."',
+            summary: 'Awaiting input'
+          }))
+        }
+
+        const { lead_info = {}, preferences = {}, intent = '', summary = '', transaction_info = {} } = parsed_data || {}
+
+        // Only handle lead/property workflows here. For other intents (e.g., transactions status),
+        // fall through so the later intent-based handler can process the request.
+        const normalizedIntentLead = (parsed_data?.intent || '').toString().toLowerCase()
+        const leadIntents = new Set(['find_properties', 'create_lead', 'update_preferences', 'create_transaction'])
+        if (!parsed_data || (normalizedIntentLead && !leadIntents.has(normalizedIntentLead))) {
+          // Not a lead/property flow. Handle common intents here to avoid re-reading the request body.
+          // Normalize common fields
+          const agent = body.agent || body.agent_name
+          const limit = typeof body.limit === 'number' ? body.limit : 5
+
+          // Get lightweight intent/entities if absent
+          let intentLight = (body.intent || '').toString()
+          let entities = body.entities || {}
+
+          // Heuristic pre-detection for common phrasing like "status of priya sharma"
+          if (!intentLight && (query || '').trim()) {
+            const lc = query.toLowerCase()
+            if (lc.includes('status') && (lc.includes('transaction') || lc.includes('deal') || lc.includes('status of'))) {
+              intentLight = 'transactions.status'
+              // Extract name after "status of"
+              const m = lc.match(/status\s+of\s+([a-z]+(?:\s+[a-z]+){0,2})/i)
+              if (m && !entities.client_name) entities.client_name = m[1]
+            }
+            // New: seller overview quick heuristic
+            else if ((lc.includes('seller') || lc.includes('listing') || lc.includes('lead')) && lc.includes('overview')) {
+              intentLight = 'leads.overview'
+              // Extract name after "overview of" and strip trailing politeness
+              const m2 = lc.match(/overview\s+of\s+([a-z]+(?:\s+[a-z]+){0,2})(?:\s+(?:please|thanks|thank\s+you))?/i)
+              if (m2 && !entities.client_name) {
+                const cleaned = (m2[1] || '').replace(/\b(please|thanks|thank\s+you)\b/gi, ' ').replace(/[^a-z\s]/gi, ' ').replace(/\s+/g, ' ').trim()
+                if (cleaned) entities.client_name = cleaned
+              }
+            }
+          }
+
+          if (!intentLight && (query || '').trim()) {
+            try {
+              const parseRes = await handleRoute(
+                new Request(request.url, {
+                  method: 'POST',
+                  body: JSON.stringify({ text: query }),
+                  headers: { 'content-type': 'application/json' }
+                }),
+                { params: { path: ['assistant','parse'] } }
+              )
+              const j = await parseRes.json()
+              intentLight = j.intent || intentLight
+              entities = j.entities || entities
+            } catch (_) { /* ignore */ }
+          }
+
+          // Improve name detection for lowercase inputs like "priya sharma's"
+          if (!entities.client_name && (query || '').trim()) {
+            const poss = query.match(/([a-z]+(?:\s+[a-z]+){1,2})['’`´]s/i)
+            if (poss) {
+              entities.client_name = poss[1].trim()
+            }
+          }
+
+          // If still no client_name, try candidate 2-3 word sequences and verify against leads
+          if (!entities.client_name && (query || '').trim()) {
+            const words = (query.toLowerCase().match(/[a-z]+/g) || [])
+            const candidates = new Set()
+            for (let i = 0; i < words.length - 1; i++) {
+              const two = `${words[i]} ${words[i+1]}`
+              candidates.add(two)
+              if (i < words.length - 2) {
+                candidates.add(`${two} ${words[i+2]}`)
+              }
+            }
+            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            for (const cand of candidates) {
+              try {
+                const lead = await db.collection('leads').findOne({ name: new RegExp(`^${esc(cand)}$`, 'i') })
+                if (lead) { entities.client_name = lead.name; break }
+              } catch (_) { /* ignore */ }
+            }
+          }
+
+          const now = new Date()
+          const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
+          const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
+          const agentFilterTx = agent ? { assigned_agent: agent } : {}
+          const agentFilterTasks = agent ? { assignee: agent } : {}
+          const stripId = (doc) => { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
+          const makeAnswer = (title, bullets) => `${title}\n- ${bullets.filter(Boolean).join('\n- ')}`
+
+          // New: Seller lead overview intent
+          if (intentLight === 'leads.overview') {
+            // Resolve lead by name, prioritizing sellers
+            const nameRaw = entities.client_name || ''
+            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            let lead = null
+            try {
+              if (nameRaw) {
+                const nameRx = new RegExp(esc(nameRaw), 'i')
+                const candidates = await db.collection('leads')
+                  .find({ name: nameRx })
+                  .sort({ updated_at: -1 })
+                  .limit(5)
+                  .toArray()
+                if (candidates && candidates.length) {
+                  lead = candidates.find(l => String(l.lead_type || '').toLowerCase() === 'seller') || candidates[0]
+                }
+              } else {
+                // Fallback to most recent seller
+                lead = await db.collection('leads').find({ lead_type: 'seller' }).sort({ updated_at: -1 }).limit(1).next()
+              }
+            } catch (_) { /* ignore lookup errors */ }
+
+            if (!lead) {
+              const who = nameRaw ? ` for ${nameRaw}` : ''
+              const answer = makeAnswer(`I couldn't find a matching seller lead${who}.`, [
+                'Try using the exact client name as saved in CRM',
+                'Or provide an email/phone so I can locate the lead'
+              ])
+              return handleCORS(NextResponse.json({ success: true, intent: 'leads.overview', answer }))
+            }
+
+            const prefs = lead.preferences || {}
+            const sellerAddress = prefs.seller_address || prefs.address
+            const sellerPrice = prefs.seller_price ?? prefs.asking_price
+            const bullets = [
+              `Name: ${lead.name}${lead.lead_type ? ` (${lead.lead_type})` : ''}`,
+              `Contact: ${lead.email || '—'} | ${lead.phone || '—'}`,
+              sellerAddress ? `Address: ${sellerAddress}` : null,
+              sellerPrice != null ? `Asking price: $${Number(sellerPrice).toLocaleString()}` : null,
+              prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` • ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` • ${prefs.seller_bathrooms} ba` : ''}` : null,
+              prefs.seller_year_built ? `Year built: ${prefs.seller_year_built}` : null,
+              prefs.seller_square_feet ? `Size: ${prefs.seller_square_feet} sqft` : null,
+              prefs.seller_lot_size ? `Lot: ${prefs.seller_lot_size}` : null,
+              prefs.seller_condition ? `Condition: ${prefs.seller_condition}` : null,
+              prefs.seller_occupancy ? `Occupancy: ${prefs.seller_occupancy}` : null,
+              prefs.seller_timeline ? `Timeline to list: ${prefs.seller_timeline}` : null,
+              prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : '—'}` : null,
+              prefs.seller_description ? `Notes: ${prefs.seller_description}` : null,
+              lead.updated_at ? `Last updated: ${new Date(lead.updated_at).toLocaleString()}` : null
+            ]
+            const overview = makeAnswer(`Seller lead overview for ${lead.name}:`, bullets)
+
+            // Dynamic next steps suggestions
+            const actions = []
+            const soonish = (prefs.seller_timeline || '').toString().toLowerCase().includes('week') || (prefs.seller_timeline || '').toString().toLowerCase().includes('soon')
+            actions.push('Schedule a listing consultation and walkthrough')
+            actions.push('Prepare CMA with 3–5 comps and pricing strategy')
+            if (prefs.seller_condition && /needs|repair|fix|update/i.test(prefs.seller_condition)) actions.push('Outline repair/refresh plan (paint, fixtures, minor repairs)')
+            else actions.push('Create a light staging/declutter checklist')
+            actions.push('Book professional photography and floor plan')
+            actions.push('Gather docs: HOA, disclosures, utility averages, survey')
+            actions.push('Draft listing timeline and MLS remarks')
+            if (soonish) actions.push('Expedite prep: compress timeline to 1–2 weeks with daily checkpoints')
+            const nextSteps = makeAnswer('Suggested next steps:', actions)
+
+            // Optional AI insights reuse
+            let insights = ''
+            try {
+              if (String(lead.lead_type || '').toLowerCase() === 'seller') {
+                insights = await generateLeadInsights(lead, [])
+              }
+            } catch (_) { /* non-fatal */ }
+
+            const answer = `${overview}\n\n${nextSteps}${insights ? `\n\nAI Insights:\n\n${insights}` : ''}`
+            return handleCORS(NextResponse.json({ success: true, intent: 'leads.overview', answer, lead: stripId(lead), ai_recommendations: insights }))
+          }
+
+          if (intentLight === 'transactions.status') {
+            const txQuery = { ...agentFilterTx, current_stage: { $ne: 'closed' } }
+            if (entities?.transaction_id) txQuery.id = entities.transaction_id
+            if (entities?.address) {
+              const rx = new RegExp(entities.address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+              txQuery.$or = [
+                { address: rx },
+                { property_address: rx },
+                { 'property.address': rx },
+                { 'property.full_address': rx },
+                { title: rx }
+              ]
+            }
+            if (entities?.client_name) {
+              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+              const nameRx = new RegExp(esc(entities.client_name), 'i')
+              txQuery.$or = [ ...(txQuery.$or || []), { client_name: nameRx } ]
+              try {
+                const leads = await db.collection('leads').find({ name: nameRx }).project({ id: 1 }).toArray()
+                const leadIds = leads.map(l => l.id).filter(Boolean)
+                if (leadIds.length) {
+                  txQuery.$or.push({ lead_id: { $in: leadIds } })
+                }
+              } catch (_) { /* ignore */ }
+            }
+            const txs = await db.collection('transactions')
+              .find(txQuery)
+              .sort({ updated_at: -1 })
+              .limit(limit)
+              .toArray()
+            const enriched = []
+            for (const tx of txs) {
+              const nextTasks = await db.collection('checklist_items')
+                .find({ transaction_id: tx.id, status: { $ne: 'completed' } })
+                .sort({ due_date: 1 })
+                .limit(3)
+                .toArray()
+              enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
+            }
+            const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
+            const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
+            const payload = { success: true, intent: 'transactions.status', answer, transactions: enriched }
+            if (body.debug) payload.debug = { intentLight, entities, matched: enriched.length }
+            return handleCORS(NextResponse.json(payload))
+          }
+
+          // If user asked for a status but intent wasn't resolved, still try transactions search
+          const lcq = (query || '').toLowerCase()
+          if (!intentLight && lcq.includes('status') && (lcq.includes('transaction') || lcq.includes('deal') || lcq.includes('status of'))) {
+            // Ensure we have a client_name if possible
+            if (!entities.client_name) {
+              const poss = (query || '').match(/([a-z]+(?:\s+[a-z]+){1,2})['’`´]s/i)
+              if (poss) entities.client_name = poss[1].trim()
+            }
+            if (!entities.client_name) {
+              const words = (lcq.match(/[a-z]+/g) || [])
+              const candidates = new Set()
+              for (let i = 0; i < words.length - 1; i++) {
+                const two = `${words[i]} ${words[i+1]}`
+                candidates.add(two)
+                if (i < words.length - 2) candidates.add(`${two} ${words[i+2]}`)
+              }
+              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+              for (const cand of candidates) {
+                try {
+                  const lead = await db.collection('leads').findOne({ name: new RegExp(`^${esc(cand)}$`, 'i') })
+                  if (lead) { entities.client_name = lead.name; break }
+                } catch (_) { /* ignore */ }
+              }
+            }
+
+            const txQuery = { ...agentFilterTx, current_stage: { $ne: 'closed' } }
+            if (entities?.client_name) {
+              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+              const nameRx = new RegExp(esc(entities.client_name), 'i')
+              txQuery.$or = [ ...(txQuery.$or || []), { client_name: nameRx } ]
+              try {
+                const leads = await db.collection('leads').find({ name: nameRx }).project({ id: 1 }).toArray()
+                const leadIds = leads.map(l => l.id).filter(Boolean)
+                if (leadIds.length) txQuery.$or.push({ lead_id: { $in: leadIds } })
+              } catch (_) { /* ignore */ }
+            }
+            const txs = await db.collection('transactions')
+              .find(txQuery)
+              .sort({ updated_at: -1 })
+              .limit(limit)
+              .toArray()
+            const enriched = []
+            for (const tx of txs) {
+              const nextTasks = await db.collection('checklist_items')
+                .find({ transaction_id: tx.id, status: { $ne: 'completed' } })
+                .sort({ due_date: 1 })
+                .limit(3)
+                .toArray()
+              enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
+            }
+            const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
+            const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
+            return handleCORS(NextResponse.json({ success: true, intent: 'transactions.status', answer, transactions: enriched }))
+          }
+
+          // Fallback quick snapshot
+          const recentLeads = await db.collection('leads').find(agent ? { assigned_agent: agent } : {}).sort({ created_at: -1 }).limit(5).toArray()
+          const overdueCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...(agent ? { assignee: agent } : {}) })
+          const alertsResult = await getSmartAlerts(db, agent ? { agent } : {})
+          const bullets = [
+            `${recentLeads.length} recent leads`,
+            `${overdueCount} overdue tasks`,
+            `${(alertsResult?.total ?? (alertsResult?.alerts?.length ?? 0))} smart alerts`
+          ]
+          const answer = makeAnswer('Here is a quick snapshot:', bullets)
+          return handleCORS(NextResponse.json({ success: true, intent: 'general.suggestions', answer, recent_leads: recentLeads.map(stripId), overdue_tasks: overdueCount, smart_alerts: (alertsResult?.alerts || []).map(stripId) }))
+        } else {
+
+        // Step 1: Find or create lead
         let lead = null
         let isNewLead = false
 
-        // Step 1: Check if lead exists
-        if (lead_info.name || lead_info.email || lead_info.phone) {
-          const searchQuery = {}
-          if (lead_info.email) searchQuery.email = lead_info.email
-          if (lead_info.phone) searchQuery.phone = lead_info.phone
-          if (lead_info.name && !lead_info.email && !lead_info.phone) {
-            searchQuery.name = { $regex: lead_info.name, $options: 'i' }
-          }
-
-          if (Object.keys(searchQuery).length > 0) {
-            lead = await db.collection('leads').findOne({
-              $or: Object.entries(searchQuery).map(([key, value]) => ({ [key]: value }))
-            })
-          }
+        const leadQuery = []
+        if (lead_info.email) leadQuery.push({ email: lead_info.email })
+        if (lead_info.phone) leadQuery.push({ phone: lead_info.phone })
+        if (leadQuery.length) {
+          lead = await db.collection('leads').findOne({ $or: leadQuery })
+        }
+        if (!lead && lead_info.name) {
+          lead = await db.collection('leads').findOne({ name: { $regex: new RegExp(`^${lead_info.name}$`, 'i') } })
         }
 
-        // Step 2: Create new lead if not found
-        if (!lead && lead_info.name) {
+        if (!lead && (lead_info.name || lead_info.email || lead_info.phone)) {
           const newLead = {
             id: uuidv4(),
-            name: lead_info.name,
-            email: lead_info.email || `${lead_info.name.toLowerCase().replace(/\s+/g, '.')}@temp.email`,
-            phone: lead_info.phone || `(555) ${Math.floor(Math.random() * 900) + 100}-${Math.floor(Math.random() * 9000) + 1000}`,
+            name: lead_info.name || 'Unknown',
+            email: lead_info.email || null,
+            phone: lead_info.phone || null,
             lead_type: lead_info.lead_type || 'buyer',
             preferences: preferences || {},
-            assigned_agent: body.agent_name || 'AI Assistant',
-            tags: ['ai-created', 'assistant'],
+            assigned_agent: agent_name || null,
+            tags: [],
             status: 'new',
             created_at: new Date(),
-            updated_at: new Date(),
-            source: 'assistant',
-            original_message: body.original_message
+            updated_at: new Date()
           }
-
           await db.collection('leads').insertOne(newLead)
           lead = newLead
           isNewLead = true
-
-          // Generate AI insights for new lead
-          const insights = await generateLeadInsights(lead)
-          if (insights) {
+        } else if (lead) {
+          // Only merge preferences if payload contains real values; otherwise keep existing prefs intact
+          const cleanPrefs = sanitizePreferences(preferences)
+          if (Object.keys(cleanPrefs).length) {
             await db.collection('leads').updateOne(
               { id: lead.id },
-              { $set: { ai_insights: insights, updated_at: new Date() } }
+              { $set: { preferences: { ...(lead.preferences || {}), ...cleanPrefs }, updated_at: new Date() } }
             )
-            lead.ai_insights = insights
+            lead = await db.collection('leads').findOne({ id: lead.id })
           }
         }
 
-        // Step 3: Update existing lead preferences if provided
-        if (lead && !isNewLead && preferences && Object.keys(preferences).length > 0) {
-          const updatedPreferences = { ...lead.preferences, ...preferences }
-          await db.collection('leads').updateOne(
-            { id: lead.id },
-            { 
-              $set: { 
-                preferences: updatedPreferences,
-                updated_at: new Date()
-              }
-            }
-          )
-          lead.preferences = updatedPreferences
-        }
-
-        // Step 4: Search for properties
+        // Step 2: Determine effective preferences (incoming or stored)
+        const cleanedIncoming = sanitizePreferences(preferences)
+        const effectivePrefs = Object.keys(cleanedIncoming).length ? cleanedIncoming : (lead?.preferences || {})
+        // Branch by lead type: sellers get insights (no listing search); buyers get property search
+        const leadType = String(lead?.lead_type || lead_info?.lead_type || '').toLowerCase()
         let properties = []
-        if (preferences && Object.keys(preferences).length > 0) {
-          const propertyResult = await fetchProperties({
-            location: preferences.zipcode,
-            beds: preferences.bedrooms,
-            baths: preferences.bathrooms,
-            min_price: preferences.min_price,
-            max_price: preferences.max_price,
-            property_type: preferences.property_type
-          })
-          properties = propertyResult.properties || []
+        let filters = null
+        if (leadType === 'seller') {
+          // No property search for sellers. Ensure we capture seller-specific fields for insights.
+          const prefsUpdate = {}
+          if (transaction_info?.property_address && !effectivePrefs.seller_address && !effectivePrefs.address) {
+            prefsUpdate.seller_address = transaction_info.property_address
+          }
+          if ((transaction_info?.listing_price || transaction_info?.price) && !effectivePrefs.seller_price && !effectivePrefs.asking_price) {
+            const priceNum = typeof transaction_info.listing_price === 'number' ? transaction_info.listing_price
+              : (typeof transaction_info.price === 'number' ? transaction_info.price : undefined)
+            if (typeof priceNum === 'number') prefsUpdate.seller_price = priceNum
+          }
+          if (Object.keys(prefsUpdate).length) {
+            await db.collection('leads').updateOne(
+              { id: lead.id },
+              { $set: { preferences: { ...(lead.preferences || {}), ...prefsUpdate }, updated_at: new Date() } }
+            )
+            lead = await db.collection('leads').findOne({ id: lead.id })
+          }
+        } else {
+          filters = mapLeadPreferencesToFilters(effectivePrefs)
+          const propertySearchResult = await searchProperties(filters)
+          properties = Array.isArray(propertySearchResult)
+            ? propertySearchResult
+            : (propertySearchResult?.properties || [])
         }
 
-        // Step 5: Generate AI recommendations
-        let aiRecommendations = null
-        if (properties.length > 0) {
-          const recommendationMessages = [
-            {
-              role: "system",
-              content: "You are a real estate assistant. Based on the agent's request and available properties, provide personalized recommendations."
-            },
-            {
-              role: "user",
-              content: `Agent Request: "${body.original_message}"
-              
-              Lead: ${lead ? lead.name : 'Unknown'} (${lead?.lead_type || 'buyer'})
-              Preferences: ${JSON.stringify(preferences)}
-              Found Properties: ${properties.length}
-              
-              Provide a brief, helpful response about the property matches and next steps.`
+        // Step 3: Optionally create a transaction if requested
+        const normalizedIntent = (intent || '').toString().toLowerCase()
+        const isCreateTransaction = normalizedIntent.includes('create_transaction') ||
+          (normalizedIntent.includes('create') && normalizedIntent.includes('transaction')) ||
+          normalizedIntent.includes('open a deal') ||
+          normalizedIntent.includes('start a transaction') ||
+          normalizedIntent.includes('create deal')
+
+        let createdTransaction = null
+        if (isCreateTransaction && lead) {
+          try {
+            const txInfo = transaction_info || {}
+            const resolvedType = txInfo.transaction_type || (lead.lead_type === 'buyer' ? 'purchase' : 'sale')
+            const priceValue = typeof txInfo.price === 'number' ? txInfo.price : (typeof txInfo.price === 'string' ? parseFloat(txInfo.price.toString().replace(/[^0-9.]/g, '')) : undefined)
+            const listingPrice = typeof txInfo.listing_price === 'number' ? txInfo.listing_price : (resolvedType === 'sale' ? priceValue : undefined)
+            const contractPrice = typeof txInfo.contract_price === 'number' ? txInfo.contract_price : (resolvedType !== 'sale' ? priceValue : undefined)
+            const closingDate = txInfo.closing_date ? new Date(txInfo.closing_date) : null
+
+            const initialStage = (resolvedType === 'purchase') ? 'pre_approval' : 'pre_listing'
+            const transactionDoc = {
+              id: uuidv4(),
+              lead_id: lead.id,
+              property_address: txInfo.property_address || preferences?.zipcode || '',
+              client_name: lead.name,
+              client_email: lead.email,
+              client_phone: lead.phone,
+              transaction_type: resolvedType || 'sale',
+              current_stage: initialStage,
+              assigned_agent: agent_name || lead.assigned_agent || 'AI Assistant',
+              listing_price: listingPrice,
+              contract_price: contractPrice,
+              closing_date: closingDate,
+              created_at: new Date(),
+              updated_at: new Date(),
+              stage_history: [{
+                stage: initialStage,
+                entered_at: new Date(),
+                status: 'active'
+              }],
+              source: 'assistant',
+              original_message: original_message
             }
-          ]
-          
-          aiRecommendations = await callOpenAI('gpt-4o-mini', recommendationMessages)
+
+            await db.collection('transactions').insertOne(transactionDoc)
+            await createDefaultChecklistItems(db, transactionDoc.id, initialStage, resolvedType)
+
+            const { _id, ...cleanedTx } = transactionDoc
+            createdTransaction = cleanedTx
+          } catch (txErr) {
+            console.error('Assistant create transaction error:', txErr)
+          }
         }
 
-        // Step 6: Store conversation in chat history
+        // Step 4: AI recommendations/confirmation
+        let aiRecommendations = ''
+        try {
+          if (leadType === 'seller') {
+            // Seller-focused insights: valuation/pricing/listing-prep, no property suggestions
+            aiRecommendations = await generateLeadInsights(lead, [])
+          } else {
+            // Buyer-focused insights that can leverage the found properties
+            aiRecommendations = await generateLeadInsights(lead, properties)
+          }
+        } catch (e) {
+          console.warn('AI recommendation generation failed:', e)
+          aiRecommendations = 'Your request has been processed.'
+        }
+
+        // Persist AI insights on the lead for UI display
+        try {
+          if (lead?.id && aiRecommendations) {
+            await db.collection('leads').updateOne(
+              { id: lead.id },
+              { $set: { ai_insights: aiRecommendations, updated_at: new Date() } }
+            )
+          }
+        } catch (e) {
+          console.warn('Failed to persist ai_insights in assistant.match:', e)
+        }
+
+        // Step 5: Store conversation in chat history
         const conversationEntry = {
           id: uuidv4(),
-          agent_message: body.original_message,
-          parsed_data: body.parsed_data,
+          agent_message: original_message,
+          parsed_data,
           lead_id: lead?.id || null,
+          transaction_id: createdTransaction?.id || null,
           properties_found: properties.length,
           ai_response: aiRecommendations,
           created_at: new Date()
@@ -1950,13 +3492,15 @@ async function handleRoute(request, { params }) {
           success: true,
           lead: lead ? { ...lead, _id: undefined } : null,
           is_new_lead: isNewLead,
+          created_transaction: createdTransaction || null,
+          transaction_id: createdTransaction?.id || null,
           properties: properties.slice(0, 10),
           properties_count: properties.length,
           ai_recommendations: aiRecommendations,
           conversation_id: conversationEntry.id,
           summary: summary
         }))
-
+        }
       } catch (error) {
         console.error('Assistant match error:', error)
         return handleCORS(NextResponse.json({
@@ -1966,7 +3510,7 @@ async function handleRoute(request, { params }) {
         }, { status: 500 }))
       }
     }
-
+    
     // GET /api/assistant/conversations - Get conversation history
     if (route === '/assistant/conversations' && method === 'GET') {
       try {
@@ -2036,14 +3580,16 @@ async function handleRoute(request, { params }) {
           }, { status: 400 }))
         }
 
+        const txType = (body.transaction_type || 'sale').toLowerCase()
+        const initialStage = txType === 'purchase' ? 'pre_approval' : 'pre_listing'
         const transaction = {
           id: uuidv4(),
           property_address: body.property_address,
           client_name: body.client_name,
           client_email: body.client_email,
           client_phone: body.client_phone,
-          transaction_type: body.transaction_type || 'sale', // sale, purchase, lease
-          current_stage: 'pre_listing',
+          transaction_type: txType, // sale, purchase, lease
+          current_stage: initialStage,
           assigned_agent: body.assigned_agent,
           listing_price: body.listing_price,
           contract_price: body.contract_price,
@@ -2051,7 +3597,7 @@ async function handleRoute(request, { params }) {
           created_at: new Date(),
           updated_at: new Date(),
           stage_history: [{
-            stage: 'pre_listing',
+            stage: initialStage,
             entered_at: new Date(),
             status: 'active'
           }]
@@ -2060,7 +3606,7 @@ async function handleRoute(request, { params }) {
         await db.collection('transactions').insertOne(transaction)
 
         // Create default checklist items for the initial stage
-        await createDefaultChecklistItems(db, transaction.id, 'pre_listing')
+        await createDefaultChecklistItems(db, transaction.id, initialStage, txType)
 
         const { _id, ...cleanedTransaction } = transaction
         return handleCORS(NextResponse.json({
@@ -2144,12 +3690,43 @@ async function handleRoute(request, { params }) {
       }
     }
 
+    // DELETE /api/transactions/:id - Delete transaction and associated checklist items
+    if (route.match(/^\/transactions\/[^\/]+$/) && method === 'DELETE') {
+      try {
+        const transactionId = path[1]
+
+        const result = await db.collection('transactions').deleteOne({ id: transactionId })
+
+        if (result.deletedCount === 0) {
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: "Transaction not found"
+          }, { status: 404 }))
+        }
+
+        // Also delete related checklist items
+        const checklistResult = await db.collection('checklist_items').deleteMany({ transaction_id: transactionId })
+
+        return handleCORS(NextResponse.json({
+          success: true,
+          message: "Transaction deleted successfully",
+          deleted_checklist_items: checklistResult?.deletedCount || 0
+        }))
+      } catch (error) {
+        console.error('Error deleting transaction:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to delete transaction'
+        }, { status: 500 }))
+      }
+    }
+
     // POST /api/transactions/:id/stage-transition - Transition to next stage with validation
     if (route.match(/^\/transactions\/[^\/]+\/stage-transition$/) && method === 'POST') {
       try {
         const transactionId = path[1]
         const body = await request.json()
-        
+
         const transaction = await db.collection('transactions').findOne({ id: transactionId })
         if (!transaction) {
           return handleCORS(NextResponse.json({
@@ -2158,12 +3735,21 @@ async function handleRoute(request, { params }) {
           }, { status: 404 }))
         }
 
-        const { target_stage, force = false } = body
+        const target_stage = body.target_stage || body.targetStage
+        const force = !!body.force
         const currentStage = transaction.current_stage
+        const txType = (transaction.transaction_type || 'sale').toLowerCase()
 
-        // Use o1-mini to validate stage transition
+        if (!target_stage || typeof target_stage !== 'string') {
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: "target_stage is required"
+          }, { status: 400 }))
+        }
+
+        // Validate stage transition (AI + fallback)
         const validationResult = await validateStageTransition(db, transactionId, currentStage, target_stage, force)
-        
+
         if (!validationResult.valid && !force) {
           return handleCORS(NextResponse.json({
             success: false,
@@ -2174,124 +3760,201 @@ async function handleRoute(request, { params }) {
           }, { status: 422 }))
         }
 
-        // Update transaction stage
-        const stageUpdate = {
-          $set: {
-            current_stage: target_stage,
-            updated_at: new Date()
-          },
-          $push: {
-            stage_history: {
-              stage: target_stage,
-              entered_at: new Date(),
-              status: 'active',
-              transitioned_from: currentStage,
-              validation_result: validationResult
-            }
-          }
-        }
-
+        // Update transaction stage and history
         await db.collection('transactions').updateOne(
           { id: transactionId },
-          stageUpdate
+          {
+            $set: {
+              current_stage: target_stage,
+              updated_at: new Date()
+            },
+            $push: {
+              stage_history: {
+                stage: target_stage,
+                entered_at: new Date(),
+                status: 'active',
+                transitioned_from: currentStage,
+                validation_result: validationResult
+              }
+            }
+          }
         )
 
-        // Create default checklist items for new stage
-        await createDefaultChecklistItems(db, transactionId, target_stage)
+        // Create default checklist items for the new stage (buyer vs seller aware)
+        const createdItems = await createDefaultChecklistItems(db, transactionId, target_stage, txType)
 
-        const updatedTransaction = await db.collection('transactions').findOne({ id: transactionId })
-        const { _id, ...cleanedTransaction } = updatedTransaction
-        
         return handleCORS(NextResponse.json({
           success: true,
-          transaction: cleanedTransaction,
+          from_stage: currentStage,
+          to_stage: target_stage,
+          created_items: createdItems,
           validation_result: validationResult
-        }))
+        }, { status: 201 }))
       } catch (error) {
-        console.error('Error transitioning stage:', error)
+        console.error('Error processing stage transition:', error)
         return handleCORS(NextResponse.json({
           success: false,
-          error: 'Failed to transition stage'
+          error: 'Failed to process stage transition'
         }, { status: 500 }))
       }
     }
 
-    // GET /api/transactions/:id/checklist - Get checklist items for transaction
+    // GET /api/transactions/:id/checklist - Get checklist items for a transaction
     if (route.match(/^\/transactions\/[^\/]+\/checklist$/) && method === 'GET') {
       try {
         const transactionId = path[1]
         const url = new URL(request.url)
         const stage = url.searchParams.get('stage')
-        
-        let query = { transaction_id: transactionId }
-        if (stage) query.stage = stage
-        
-        const checklistItems = await db.collection('checklist_items')
-          .find(query)
-          .sort({ stage_order: 1, order: 1 })
-          .toArray()
+        const status = url.searchParams.get('status')
 
-        const cleanedItems = checklistItems.map(({ _id, ...rest }) => rest)
-        
-        return handleCORS(NextResponse.json({
-          success: true,
-          checklist_items: cleanedItems,
-          total: cleanedItems.length
-        }))
+        const transaction = await db.collection('transactions').findOne({ id: transactionId })
+        if (!transaction) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Transaction not found' }, { status: 404 }))
+        }
+
+        const txType = (transaction.transaction_type || 'sale').toLowerCase()
+        const query = { transaction_id: transactionId }
+        if (stage) query.stage = stage
+        if (status) query.status = status
+
+        let items = await db.collection('checklist_items').find(query).toArray()
+        items = items.map((it) => {
+          if (typeof it.stage_order !== 'number' || Number.isNaN(it.stage_order)) {
+            it.stage_order = getStageOrder(it.stage, txType)
+          }
+          if (typeof it.weight !== 'number' || Number.isNaN(it.weight)) {
+            it.weight = 1
+          }
+          if (it.parent_id === undefined) {
+            it.parent_id = null
+          }
+          const { _id, ...rest } = it
+          return rest
+        })
+        items.sort(
+          (a, b) =>
+            (a.stage_order || 0) - (b.stage_order || 0) ||
+            (a.order || 0) - (b.order || 0) ||
+            String(a.title || '').localeCompare(String(b.title || ''))
+        )
+
+        return handleCORS(
+          NextResponse.json({ success: true, checklist_items: items, total: items.length })
+        )
       } catch (error) {
-        console.error('Error fetching checklist:', error)
-        return handleCORS(NextResponse.json({
-          success: false,
-          error: 'Failed to fetch checklist'
-        }, { status: 500 }))
+        console.error('Error fetching checklist items:', error)
+        return handleCORS(
+          NextResponse.json(
+            { success: false, error: 'Failed to fetch checklist items' },
+            { status: 500 }
+          )
+        )
       }
     }
 
-    // POST /api/transactions/:id/checklist - Add checklist item
+    // POST /api/transactions/:id/checklist - Manually add a checklist item to a transaction
     if (route.match(/^\/transactions\/[^\/]+\/checklist$/) && method === 'POST') {
       try {
         const transactionId = path[1]
         const body = await request.json()
-        
-        if (!body.title || !body.stage) {
-          return handleCORS(NextResponse.json({
-            success: false,
-            error: "Title and stage are required"
-          }, { status: 400 }))
+
+        const transaction = await db.collection('transactions').findOne({ id: transactionId })
+        if (!transaction) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Transaction not found' }, { status: 404 }))
         }
 
-        const checklistItem = {
+        if (!body.title || typeof body.title !== 'string') {
+          return handleCORS(NextResponse.json({ success: false, error: 'title is required' }, { status: 400 }))
+        }
+
+        const txType = (transaction.transaction_type || 'sale').toLowerCase()
+        let stage = (body.stage || transaction.current_stage)
+
+        const parentId = body.parent_id || null
+        let order
+        let stage_order
+
+        if (parentId) {
+          // Validate parent exists in same transaction
+          const parent = await db.collection('checklist_items').findOne({ id: parentId, transaction_id: transactionId })
+          if (!parent) {
+            return handleCORS(NextResponse.json({ success: false, error: 'Invalid parent_id: parent not found in this transaction' }, { status: 400 }))
+          }
+          // Child should inherit parent's stage/order for grouping
+          stage = parent.stage
+          order = parent.order || 1
+          stage_order = parent.stage_order || getStageOrder(stage, txType)
+        } else {
+          // Determine next order within this stage for a new parent item
+          const existingCount = await db.collection('checklist_items').countDocuments({ transaction_id: transactionId, stage })
+          order = existingCount + 1
+          stage_order = getStageOrder(stage, txType)
+        }
+
+        const due_date = body.due_date
+          ? new Date(body.due_date)
+          : (body.due_days ? new Date(Date.now() + Number(body.due_days) * 24 * 60 * 60 * 1000) : null)
+
+        const weight = (body.weight !== undefined && Number.isFinite(Number(body.weight))) ? Number(body.weight) : 1
+
+        const item = {
           id: uuidv4(),
           transaction_id: transactionId,
           title: body.title,
           description: body.description || '',
-          stage: body.stage,
-          status: body.status || 'not_started', // not_started, in_progress, completed, blocked
-          priority: body.priority || 'medium', // low, medium, high, urgent
+          stage,
+          status: body.status || 'not_started',
+          priority: body.priority || 'medium',
           assignee: body.assignee || '',
-          due_date: body.due_date ? new Date(body.due_date) : null,
+          due_date,
           completed_date: null,
           notes: body.notes || '',
-          order: body.order || 999,
-          stage_order: getStageOrder(body.stage),
-          dependencies: body.dependencies || [],
+          order,
+          stage_order,
+          dependencies: Array.isArray(body.dependencies) ? body.dependencies : [],
+          weight,
+          parent_id: parentId,
           created_at: new Date(),
           updated_at: new Date()
         }
 
-        await db.collection('checklist_items').insertOne(checklistItem)
+        await db.collection('checklist_items').insertOne(item)
 
-        const { _id, ...cleanedItem } = checklistItem
-        return handleCORS(NextResponse.json({
-          success: true,
-          checklist_item: cleanedItem
-        }, { status: 201 }))
+        // If creating a parent with provided subtasks, insert them as children
+        if (!parentId && Array.isArray(body.subtasks) && body.subtasks.length > 0) {
+          const children = body.subtasks
+            .filter(st => st && typeof st.title === 'string' && st.title.trim() !== '')
+            .map((st) => ({
+              id: uuidv4(),
+              transaction_id: transactionId,
+              title: st.title,
+              description: st.description || '',
+              stage,
+              status: st.status || 'not_started',
+              priority: st.priority || (body.priority || 'medium'),
+              assignee: st.assignee || '',
+              due_date: st.due_date ? new Date(st.due_date) : (st.due_days ? new Date(Date.now() + Number(st.due_days) * 24 * 60 * 60 * 1000) : null),
+              completed_date: null,
+              notes: st.notes || '',
+              order,
+              stage_order,
+              dependencies: Array.isArray(st.dependencies) ? st.dependencies : [],
+              weight: (st.weight !== undefined && Number.isFinite(Number(st.weight))) ? Number(st.weight) : 1,
+              parent_id: item.id,
+              created_at: new Date(),
+              updated_at: new Date()
+            }))
+
+          if (children.length > 0) {
+            await db.collection('checklist_items').insertMany(children)
+          }
+        }
+
+        const { _id, ...cleanedItem } = item
+        return handleCORS(NextResponse.json({ success: true, checklist_item: cleanedItem }, { status: 201 }))
       } catch (error) {
         console.error('Error creating checklist item:', error)
-        return handleCORS(NextResponse.json({
-          success: false,
-          error: 'Failed to create checklist item'
-        }, { status: 500 }))
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to create checklist item' }, { status: 500 }))
       }
     }
 
@@ -2300,22 +3963,82 @@ async function handleRoute(request, { params }) {
       try {
         const itemId = path[1]
         const body = await request.json()
-        
-        const updateData = {
-          ...body,
-          updated_at: new Date()
+
+        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        if (!existing) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Checklist item not found' }, { status: 404 }))
         }
-        
-        // Handle status changes
-        if (body.status === 'completed' && body.status !== updateData.original_status) {
-          updateData.completed_date = new Date()
-        } else if (body.status !== 'completed') {
-          updateData.completed_date = null
+
+        const updateData = { updated_at: new Date() }
+
+        // Whitelist fields
+        if ('title' in body) updateData.title = body.title
+        if ('description' in body) updateData.description = body.description || ''
+        if ('priority' in body) updateData.priority = body.priority || 'medium'
+        if ('assignee' in body) updateData.assignee = body.assignee || ''
+        if ('notes' in body) updateData.notes = body.notes || ''
+        if ('dependencies' in body && Array.isArray(body.dependencies)) updateData.dependencies = body.dependencies
+        if ('due_date' in body) {
+          updateData.due_date = body.due_date ? new Date(body.due_date) : null
         }
-        
-        delete updateData.id
-        delete updateData.created_at
-        delete updateData.original_status
+        // Allow scheduling fields for calendar planning
+        if ('scheduled_start' in body) {
+          updateData.scheduled_start = body.scheduled_start ? new Date(body.scheduled_start) : null
+        }
+        if ('scheduled_end' in body) {
+          updateData.scheduled_end = body.scheduled_end ? new Date(body.scheduled_end) : null
+        }
+        // Basic validation if either schedule field is provided
+        if ('scheduled_start' in body || 'scheduled_end' in body) {
+          const s = ('scheduled_start' in body)
+            ? (body.scheduled_start ? new Date(body.scheduled_start) : null)
+            : (existing.scheduled_start ? new Date(existing.scheduled_start) : null)
+          const e = ('scheduled_end' in body)
+            ? (body.scheduled_end ? new Date(body.scheduled_end) : null)
+            : (existing.scheduled_end ? new Date(existing.scheduled_end) : null)
+          if (s && e && e <= s) {
+            return handleCORS(NextResponse.json({ success: false, error: 'scheduled_end must be after scheduled_start' }, { status: 400 }))
+          }
+        }
+        if ('weight' in body) {
+          if (body.weight === null || body.weight === undefined) {
+            // ignore
+          } else if (!Number.isFinite(Number(body.weight))) {
+            return handleCORS(NextResponse.json({ success: false, error: 'Invalid weight' }, { status: 400 }))
+          } else {
+            updateData.weight = Number(body.weight)
+          }
+        }
+
+        // Handle parent assignment changes
+        if ('parent_id' in body) {
+          if (body.parent_id === existing.id) {
+            return handleCORS(NextResponse.json({ success: false, error: 'parent_id cannot reference the item itself' }, { status: 400 }))
+          }
+          if (body.parent_id === null || body.parent_id === '' ) {
+            updateData.parent_id = null
+          } else {
+            const parent = await db.collection('checklist_items').findOne({ id: body.parent_id, transaction_id: existing.transaction_id })
+            if (!parent) {
+              return handleCORS(NextResponse.json({ success: false, error: 'Invalid parent_id: parent not found in this transaction' }, { status: 400 }))
+            }
+            updateData.parent_id = parent.id
+            // Align grouping with parent
+            updateData.stage = parent.stage
+            updateData.stage_order = parent.stage_order || getStageOrder(parent.stage)
+            updateData.order = parent.order || 1
+          }
+        }
+
+        // Handle status changes based on previous status
+        if ('status' in body) {
+          updateData.status = body.status
+          if (body.status === 'completed' && existing.status !== 'completed') {
+            updateData.completed_date = new Date()
+          } else if (body.status !== 'completed' && existing.status === 'completed') {
+            updateData.completed_date = null
+          }
+        }
 
         const result = await db.collection('checklist_items').updateOne(
           { id: itemId },
@@ -2479,6 +4202,8 @@ async function handleRoute(request, { params }) {
       }
     }
 
+    
+
     // GET /api/alerts/smart - Get smart alerts for dashboard
     if (route === '/alerts/smart' && method === 'GET') {
       try {
@@ -2516,6 +4241,15 @@ async function handleRoute(request, { params }) {
         )
 
         if (result.matchedCount > 0) {
+          // SSE broadcast
+          try {
+            const g = globalThis
+            if (g.__crmSSE?.clients) {
+              const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+              for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('alerts:changed', { id: alertId })) } catch {} }
+              for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'alert_dismissed', id: alertId })) } catch {} }
+            }
+          } catch (_) {}
           return handleCORS(NextResponse.json({
             success: true,
             message: "Alert dismissed"
@@ -2538,10 +4272,20 @@ async function handleRoute(request, { params }) {
     // POST /api/alerts/generate - Manually trigger alert generation
     if (route === '/alerts/generate' && method === 'POST') {
       try {
-        await generateSmartAlerts(db)
+        const upserted = await generateSmartAlerts(db)
+        // SSE broadcast so UI refreshes immediately
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('alerts:changed', { reason: 'alerts_generated', count: upserted.length })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'alerts_generated' })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
         return handleCORS(NextResponse.json({
           success: true,
-          message: "Alerts generated successfully"
+          message: "Alerts generated successfully",
+          generated: upserted.length
         }))
       } catch (error) {
         console.error('Alert generation error:', error)
@@ -2552,6 +4296,788 @@ async function handleRoute(request, { params }) {
       }
     }
     
+    // POST /api/assistant/parse - lightweight NL intent parser
+    if (route === '/assistant/parse' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const text = (body.text || body.query || body.message || '').toString()
+        const raw = text
+        const lc = text.toLowerCase()
+        const entities = {}
+
+        // Extract potential transaction id (simple heuristic for UUID-like or custom ids)
+        const idMatch = lc.match(/(?:id|tx|transaction)[^\w]?[:#\s]*([a-z0-9\-]{6,})/)
+        if (idMatch) entities.transaction_id = idMatch[1]
+
+        // Extract an address-ish token (very naive fallback: quoted string or street number phrase)
+        const quoted = raw.match(/["']([^"']{5,})["']/)
+        if (quoted) entities.address = quoted[1]
+        else {
+          const addr = raw.match(/(\d{1,6}\s+[^,\n]{3,40}(?:\s+(?:st|street|ave|avenue|rd|road|dr|drive|blvd|lane|ln|court|ct)\b[^,\n]*)?)/i)
+          if (addr) entities.address = addr[1]
+        }
+
+        // Extract a person-like name (simple heuristic: two or three capitalized words)
+        const nameMatch = raw.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/)
+        if (nameMatch) {
+          entities.client_name = nameMatch[1]
+        }
+
+        let intent = 'general.suggestions'
+        let confidence = 0.55
+
+        if ((lc.includes('overdue') || lc.includes('high priority')) && lc.includes('task')) { intent = 'tasks.overdue'; confidence = 0.9 }
+        else if (lc.includes('today') && lc.includes('task')) { intent = 'tasks.today'; confidence = 0.85 }
+        else if (lc.includes('alert')) { intent = 'alerts.summary'; confidence = 0.8 }
+        else if (lc.includes('pipeline') || (lc.includes('summary') && lc.includes('deal'))) { intent = 'pipeline.summary'; confidence = 0.75 }
+        else if ((lc.includes('transaction') || lc.includes('deal')) && (lc.includes('status') || lc.includes('update') || lc.includes('progress'))) { intent = 'transactions.status'; confidence = 0.88 }
+        else if ((lc.includes('seller') || lc.includes('listing') || lc.includes('lead')) && (lc.includes('overview') || lc.includes('know more') || lc.includes('about') || lc.includes('start') || lc.includes('how to start') || lc.includes('how to begin'))) { intent = 'leads.overview'; confidence = 0.9 }
+
+        return handleCORS(NextResponse.json({ success: true, intent, entities, confidence }))
+      } catch (error) {
+        console.error('Assistant parse error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to parse query' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/assistant/match - execute intent and return structured answer
+    if (route === '/assistant/match' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        let { intent, entities = {}, agent, limit = 5, query } = body
+        // Normalize alternate field names from existing frontend
+        if (!query) query = body.original_message || body.text || body.message || ''
+        if (!agent) agent = body.agent_name
+        if (!intent && query) {
+          // Fallback: self-parse
+          const parseRes = await handleRoute(new Request(request.url, { method: 'POST', body: JSON.stringify({ text: query }), headers: { 'content-type': 'application/json' } }), { params: { path: ['assistant','parse'] } })
+          try { const j = await parseRes.json(); intent = j.intent; entities = j.entities || entities } catch {}
+        }
+
+        const now = new Date()
+        const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
+        const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
+        const sevenDaysFromNow = new Date(now.getTime() + 7*24*60*60*1000)
+        const sevenDaysAgo = new Date(now.getTime() - 7*24*60*60*1000)
+
+        const agentFilterTx = agent ? { assigned_agent: agent } : {}
+        const agentFilterTasks = agent ? { assignee: agent } : {}
+
+        const stripId = (doc) => { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
+
+        const makeAnswer = (title, bullets) => `${title}\n- ${bullets.filter(Boolean).join('\n- ')}`
+
+        // Intent handlers
+        if (intent === 'transactions.status') {
+          const txQuery = { ...agentFilterTx, current_stage: { $ne: 'closed' } }
+          if (entities.transaction_id) txQuery.id = entities.transaction_id
+          if (entities.address) {
+            const rx = new RegExp(entities.address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+            txQuery.$or = [
+              { address: rx },
+              { property_address: rx },
+              { 'property.address': rx },
+              { 'property.full_address': rx },
+              { title: rx }
+            ]
+          }
+          // Search by client name and related leads if provided
+          if (entities.client_name) {
+            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            const nameRx = new RegExp(esc(entities.client_name), 'i')
+            txQuery.$or = [ ...(txQuery.$or || []), { client_name: nameRx } ]
+            try {
+              const leads = await db.collection('leads').find({ name: nameRx }).project({ id: 1 }).toArray()
+              const leadIds = leads.map(l => l.id).filter(Boolean)
+              if (leadIds.length) {
+                txQuery.$or.push({ lead_id: { $in: leadIds } })
+              }
+            } catch (_) { /* ignore lead lookup errors */ }
+          }
+          const txs = await db.collection('transactions')
+            .find(txQuery)
+            .sort({ updated_at: -1 })
+            .limit(limit)
+            .toArray()
+          const enriched = []
+          for (const tx of txs) {
+            const nextTasks = await db.collection('checklist_items')
+              .find({ transaction_id: tx.id, status: { $ne: 'completed' } })
+              .sort({ due_date: 1 })
+              .limit(3)
+              .toArray()
+            enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
+          }
+          const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
+          const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
+          return handleCORS(NextResponse.json({ success: true, intent, answer, transactions: enriched }))
+        }
+
+        if (intent === 'tasks.overdue') {
+          const overdue = await db.collection('checklist_items')
+            .find({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...agentFilterTasks })
+            .sort({ due_date: 1 })
+            .limit(20)
+            .toArray()
+          const bullets = overdue.slice(0,5).map(t => `${t.title} (due ${new Date(t.due_date).toLocaleDateString()})`)
+          const answer = makeAnswer('High-priority overdue tasks:', bullets.length ? bullets : ['No overdue tasks'])
+          return handleCORS(NextResponse.json({ success: true, intent, answer, tasks: overdue.map(stripId) }))
+        }
+
+        if (intent === 'tasks.today') {
+          const today = await db.collection('checklist_items')
+            .find({ status: { $ne: 'completed' }, due_date: { $gte: startOfToday, $lte: endOfToday }, ...agentFilterTasks })
+            .sort({ due_date: 1 })
+            .limit(20)
+            .toArray()
+          const bullets = today.slice(0,5).map(t => `${t.title} (due ${new Date(t.due_date).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})})`)
+          const answer = makeAnswer("Today's tasks:", bullets.length ? bullets : ['No tasks due today'])
+          return handleCORS(NextResponse.json({ success: true, intent, answer, tasks: today.map(stripId) }))
+        }
+
+        if (intent === 'alerts.summary') {
+          const alerts = await getSmartAlerts(db, agent ? { agent } : {})
+          const list = alerts?.alerts || []
+          const bullets = list.slice(0,5).map(a => `${a.title || a.alert_type} (${a.priority || 'normal'})`)
+          const answer = makeAnswer('Smart alerts:', bullets.length ? bullets : ['No active alerts'])
+          return handleCORS(NextResponse.json({ success: true, intent, answer, alerts: list.map(stripId), total: alerts?.total ?? list.length }))
+        }
+
+        if (intent === 'pipeline.summary') {
+          const txs = await db.collection('transactions')
+            .find({ ...agentFilterTx })
+            .toArray()
+          const byStage = {}
+          for (const tx of txs) { const s = (tx.current_stage || 'unknown'); byStage[s] = (byStage[s] || 0) + 1 }
+          const bullets = Object.entries(byStage).map(([s,c]) => `${s}: ${c}`)
+          const answer = makeAnswer('Pipeline summary by stage:', bullets.length ? bullets : ['No transactions'])
+          return handleCORS(NextResponse.json({ success: true, intent, answer, summary: byStage, total: txs.length }))
+        }
+
+        if (intent === 'leads.overview') {
+          // Resolve lead by name, prioritizing sellers
+          const nameRaw = entities.client_name || ''
+          const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          const sanitizeName = (s) => (s || '')
+            .toString()
+            .replace(/\b(please|thanks|thank\s+you)\b/gi, ' ')
+            .replace(/[^a-zA-Z\s'\-]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+          const cleanedName = sanitizeName(nameRaw)
+          let lead = null
+          try {
+            if (cleanedName) {
+              const nameRx = new RegExp(esc(cleanedName), 'i')
+              const candidates = await db.collection('leads')
+                .find({ name: nameRx })
+                .sort({ updated_at: -1 })
+                .limit(5)
+                .toArray()
+              if (candidates && candidates.length) {
+                // Prefer sellers
+                lead = candidates.find(l => String(l.lead_type || '').toLowerCase() === 'seller') || candidates[0]
+              } else {
+                // Fallback token-based search requiring all parts to be present in name
+                const parts = cleanedName.split(/\s+/).filter(Boolean)
+                if (parts.length) {
+                  const rxParts = parts.map(p => new RegExp(esc(p), 'i'))
+                  const andConds = rxParts.map(rx => ({ name: rx }))
+                  const tokenMatches = await db.collection('leads')
+                    .find({ $and: andConds })
+                    .sort({ updated_at: -1 })
+                    .limit(5)
+                    .toArray()
+                  if (tokenMatches && tokenMatches.length) {
+                    lead = tokenMatches.find(l => String(l.lead_type || '').toLowerCase() === 'seller') || tokenMatches[0]
+                  }
+                }
+              }
+            } else {
+              // Fallback to most recent seller
+              lead = await db.collection('leads').find({ lead_type: 'seller' }).sort({ updated_at: -1 }).limit(1).next()
+            }
+          } catch (_) { /* ignore lookup errors */ }
+
+          if (!lead) {
+            const who = cleanedName ? ` for ${cleanedName}` : ''
+            const answer = makeAnswer(`I couldn't find a matching seller lead${who}.`, [
+              'Try using the exact client name as saved in CRM',
+              'Or provide an email/phone so I can locate the lead'
+            ])
+            return handleCORS(NextResponse.json({ success: true, intent, answer }))
+          }
+
+          const stripId = (doc) => { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
+          const prefs = lead.preferences || {}
+          const sellerAddress = prefs.seller_address || prefs.address
+          const sellerPrice = prefs.seller_price ?? prefs.asking_price
+          const bullets = [
+            `Name: ${lead.name}${lead.lead_type ? ` (${lead.lead_type})` : ''}`,
+            `Contact: ${lead.email || '—'} | ${lead.phone || '—'}`,
+            sellerAddress ? `Address: ${sellerAddress}` : null,
+            sellerPrice != null ? `Asking price: $${Number(sellerPrice).toLocaleString()}` : null,
+            prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` • ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` • ${prefs.seller_bathrooms} ba` : ''}` : null,
+            prefs.seller_year_built ? `Year built: ${prefs.seller_year_built}` : null,
+            prefs.seller_square_feet ? `Size: ${prefs.seller_square_feet} sqft` : null,
+            prefs.seller_lot_size ? `Lot: ${prefs.seller_lot_size}` : null,
+            prefs.seller_condition ? `Condition: ${prefs.seller_condition}` : null,
+            prefs.seller_occupancy ? `Occupancy: ${prefs.seller_occupancy}` : null,
+            prefs.seller_timeline ? `Timeline to list: ${prefs.seller_timeline}` : null,
+            prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : '—'}` : null,
+            prefs.seller_description ? `Notes: ${prefs.seller_description}` : null,
+            lead.updated_at ? `Last updated: ${new Date(lead.updated_at).toLocaleString()}` : null
+          ]
+          const overview = makeAnswer(`Seller lead overview for ${lead.name}:`, bullets)
+
+          // Dynamic next steps suggestions
+          const actions = []
+          const soonish = (prefs.seller_timeline || '').toString().toLowerCase().includes('week') || (prefs.seller_timeline || '').toString().toLowerCase().includes('soon')
+          actions.push('Schedule a listing consultation and walkthrough')
+          actions.push('Prepare CMA with 3–5 comps and pricing strategy')
+          if (prefs.seller_condition && /needs|repair|fix|update/i.test(prefs.seller_condition)) actions.push('Outline repair/refresh plan (paint, fixtures, minor repairs)')
+          else actions.push('Create a light staging/declutter checklist')
+          actions.push('Book professional photography and floor plan')
+          actions.push('Gather docs: HOA, disclosures, utility averages, survey')
+          actions.push('Draft listing timeline and MLS remarks')
+          if (soonish) actions.push('Expedite prep: compress timeline to 1–2 weeks with daily checkpoints')
+          const nextSteps = makeAnswer('Suggested next steps:', actions)
+
+          // Optional AI insights reuse
+          let insights = ''
+          try {
+            if (String(lead.lead_type || '').toLowerCase() === 'seller') {
+              insights = await generateLeadInsights(lead, [])
+            }
+          } catch (_) { /* non-fatal */ }
+
+          const answer = `${overview}\n\n${nextSteps}${insights ? `\n\nAI Insights:\n\n${insights}` : ''}`
+          return handleCORS(NextResponse.json({ success: true, intent, answer, lead: stripId(lead), ai_recommendations: insights }))
+        }
+
+        // Fallback: brief suggestions snapshot
+        const recentLeads = await db.collection('leads').find(agent ? { assigned_agent: agent } : {}).sort({ created_at: -1 }).limit(5).toArray()
+        const overdueCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...(agent ? { assignee: agent } : {}) })
+        const alertsResult = await getSmartAlerts(db, agent ? { agent } : {})
+        const bullets = [
+          `${recentLeads.length} recent leads`,
+          `${overdueCount} overdue tasks`,
+          `${(alertsResult?.total ?? (alertsResult?.alerts?.length ?? 0))} smart alerts`
+        ]
+        const answer = makeAnswer('Here is a quick snapshot:', bullets)
+        return handleCORS(NextResponse.json({ success: true, intent: intent || 'general.suggestions', answer, recent_leads: recentLeads.map(stripId), overdue_tasks: overdueCount, smart_alerts: (alertsResult?.alerts || []).map(stripId) }))
+      } catch (error) {
+        console.error('Assistant match error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to fulfill request' }, { status: 500 }))
+      }
+    }
+
+    // GET /api/assistant/intents - list supported capabilities for UI/help
+    if (route === '/assistant/intents' && method === 'GET') {
+      try {
+        return handleCORS(NextResponse.json({
+          success: true,
+          intents: [
+            { key: 'leads.overview', examples: ['tell me about Priya (seller)', 'seller overview for John', 'how to start with Akash the seller'] },
+            { key: 'transactions.status', examples: ['status of my Frisco deal', 'any updates on transaction 123?'] },
+            { key: 'tasks.overdue', examples: ['high priority tasks', 'overdue tasks'] },
+            { key: 'tasks.today', examples: ["what's due today", 'today\'s checklist'] },
+            { key: 'alerts.summary', examples: ['any alerts?', 'smart alerts summary'] },
+            { key: 'pipeline.summary', examples: ['pipeline summary', 'deals by stage'] },
+            { key: 'general.suggestions', examples: ['what should I do next?'] }
+          ]
+        }))
+      } catch (error) {
+        console.error('Assistant intents error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to load intents' }, { status: 500 }))
+      }
+    }
+
+    // GET /api/assistant/suggestions - Aggregated assistant suggestions/workload
+    if (route === '/assistant/suggestions' && method === 'GET') {
+      try {
+        const url = new URL(request.url)
+        const agent = url.searchParams.get('agent')
+        const limit = parseInt(url.searchParams.get('limit')) || 5
+
+        const now = new Date()
+        const startOfToday = new Date(now)
+        startOfToday.setHours(0, 0, 0, 0)
+        const endOfToday = new Date(now)
+        endOfToday.setHours(23, 59, 59, 999)
+        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+
+        const agentFilterTx = agent ? { assigned_agent: agent } : {}
+        const agentFilterLead = agent ? { assigned_agent: agent } : {}
+        const agentFilterTasks = agent ? { assignee: agent } : {}
+
+        // Recent leads
+        const recentLeads = await db.collection('leads')
+          .find(agentFilterLead)
+          .sort({ created_at: -1 })
+          .limit(limit)
+          .toArray()
+
+        // Active transactions
+        const activeTx = await db.collection('transactions')
+          .find({ current_stage: { $ne: 'closed' }, ...agentFilterTx })
+          .sort({ created_at: -1 })
+          .toArray()
+        // Index transactions by id for quick lookup
+        const txMap = new Map((activeTx || []).map(tx => [tx.id, tx]))
+
+        // Checklist queries
+        const overdueChecklist = await db.collection('checklist_items')
+          .find({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...agentFilterTasks })
+          .sort({ due_date: 1 })
+          .limit(10)
+          .toArray()
+        const overdueHydrated = overdueChecklist.map(t => {
+          const tx = txMap.get(t.transaction_id)
+          return { ...t, client_name: tx?.client_name, property_address: tx?.property_address }
+        })
+
+        const todayChecklist = await db.collection('checklist_items')
+          .find({ status: { $ne: 'completed' }, due_date: { $gte: startOfToday, $lte: endOfToday }, ...agentFilterTasks })
+          .sort({ due_date: 1 })
+          .limit(10)
+          .toArray()
+        const todayHydrated = todayChecklist.map(t => {
+          const tx = txMap.get(t.transaction_id)
+          return { ...t, client_name: tx?.client_name, property_address: tx?.property_address }
+        })
+
+        const upcomingChecklist = await db.collection('checklist_items')
+          .find({ status: { $ne: 'completed' }, due_date: { $gt: now, $lte: sevenDaysFromNow }, ...agentFilterTasks })
+          .sort({ due_date: 1 })
+          .limit(10)
+          .toArray()
+
+        // Ensure we have transactions for all referenced checklist items (not just activeTx)
+        try {
+          const idSet = new Set([
+            ...overdueChecklist.map(t => t.transaction_id).filter(Boolean),
+            ...todayChecklist.map(t => t.transaction_id).filter(Boolean),
+            ...upcomingChecklist.map(t => t.transaction_id).filter(Boolean)
+          ])
+          const missing = [...idSet].filter(id => !txMap.has(id))
+          if (missing.length) {
+            const extraTx = await db.collection('transactions').find({ id: { $in: missing } }).toArray()
+            for (const tx of extraTx) txMap.set(tx.id, tx)
+          }
+        } catch (_) { /* non-fatal */ }
+        const upcomingHydrated = upcomingChecklist.map(t => {
+          const tx = txMap.get(t.transaction_id)
+          return { ...t, client_name: tx?.client_name, property_address: tx?.property_address }
+        })
+
+        // Stalled deals (inactive > 7 days)
+        const stalledDeals = await db.collection('transactions')
+          .find({ current_stage: { $ne: 'closed' }, updated_at: { $lt: sevenDaysAgo }, ...agentFilterTx })
+          .sort({ updated_at: 1 })
+          .limit(10)
+          .toArray()
+
+        // Smart alerts reuse
+        const alertsResult = await getSmartAlerts(db, agent ? { agent } : {})
+
+        // Recent assistant activity
+        const recentActivity = await db.collection('assistant_conversations')
+          .find({})
+          .sort({ created_at: -1 })
+          .limit(10)
+          .toArray()
+
+        // Totals for summary
+        const leadsTotal = await db.collection('leads').countDocuments(agentFilterLead)
+        const overdueCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...agentFilterTasks })
+        const dueTodayCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $gte: startOfToday, $lte: endOfToday }, ...agentFilterTasks })
+        const upcomingCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $gt: now, $lte: sevenDaysFromNow }, ...agentFilterTasks })
+
+        // Sanitize helper
+        const stripId = (doc) => {
+          if (!doc) return doc
+          const { _id, ...rest } = doc
+          return rest
+        }
+
+        // Build Next Best Actions (Phase 1): combine top overdue/today tasks and a top alert, and score them
+        const nbaItems = []
+        const pushTaskNBA = (t, tag) => {
+          const due = new Date(t.due_date)
+          const msLeft = due - now
+          const daysLeft = Math.floor(msLeft / 86400000)
+          const isOverdue = msLeft < 0
+          const urgency = isOverdue ? 'overdue' : (due >= startOfToday && due <= endOfToday ? 'due_today' : 'due_soon')
+          const base = isOverdue ? 92 : (urgency === 'due_today' ? 78 : 65)
+          const timeAdj = isFinite(daysLeft) ? Math.max(-10, Math.min(10, -daysLeft * 2)) : 0
+          const title = String(t.title || 'Task')
+          // naive duration heuristic
+          const lower = title.toLowerCase()
+          let est = 15
+          if (/call|phone|ring/.test(lower)) est = 5
+          else if (/email|text|sms|follow[- ]?up/.test(lower)) est = 8
+          else if (/mls|syndication|listing entry|photos|staging/.test(lower)) est = 30
+          else if (/agreement|contract|disclosure|docu|esign|signature/.test(lower)) est = 15
+          const priority_score = Math.max(0, Math.min(100, base + timeAdj))
+          const reasonBits = []
+          if (isOverdue) {
+            const days = Math.ceil((now - due) / 86400000)
+            reasonBits.push(`Overdue by ${days} day${days === 1 ? '' : 's'}`)
+          } else if (urgency === 'due_today') {
+            reasonBits.push('Due today')
+          } else {
+            reasonBits.push(`Due in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`)
+          }
+          if (t.client_name) reasonBits.push(`Client: ${t.client_name}`)
+          const labelDue = isNaN(due) ? '—' : (urgency === 'due_today' ? 'today' : `due ${due.toLocaleDateString()}`)
+          nbaItems.push({
+            key: `task:${t.id}`,
+            type: 'task',
+            id: t.id,
+            label: `Complete: ${title} (${labelDue})`,
+            client_name: t.client_name,
+            property_address: t.property_address,
+            transaction_id: t.transaction_id,
+            est_duration_min: est,
+            priority_score,
+            urgency,
+            impact: 'medium',
+            reason: reasonBits.join(' • '),
+            can_auto_complete: false,
+            source: tag
+          })
+        }
+
+        const pushAlertNBA = (a) => {
+          const title = a.message || a.description || a.alert_type || 'Alert'
+          const est = 2
+          const priority_score = a.priority === 'urgent' ? 90 : a.priority === 'high' ? 80 : 60
+          nbaItems.push({
+            key: `alert:${a.id}`,
+            type: 'alert',
+            id: a.id,
+            label: `Dismiss alert: ${title}`,
+            est_duration_min: est,
+            priority_score,
+            urgency: a.priority === 'urgent' ? 'urgent' : 'normal',
+            impact: a.priority === 'urgent' ? 'high' : 'medium',
+            reason: a.alert_type ? `Type: ${a.alert_type}` : 'Smart alert',
+            can_auto_complete: true,
+            source: 'alert'
+          })
+        }
+
+        // Top N tasks
+        for (const t of overdueHydrated.slice(0, 3)) pushTaskNBA(t, 'overdue')
+        if (nbaItems.length < 3) {
+          for (const t of todayHydrated) {
+            if (nbaItems.length >= 3) break
+            // avoid duplicates by id
+            if (nbaItems.some(i => i.type === 'task' && i.id === t.id)) continue
+            pushTaskNBA(t, 'today')
+          }
+        }
+        // Add one alert if we still have space
+        if (nbaItems.length < 3 && (alertsResult?.alerts || []).length > 0) {
+          pushAlertNBA(alertsResult.alerts[0])
+        }
+        // Sort by score desc and take up to `limit`
+        nbaItems.sort((a, b) => (b.priority_score || 0) - (a.priority_score || 0))
+        const nextBestActions = nbaItems.slice(0, limit)
+
+        const suggestions = {
+          success: true,
+          generated_at: new Date(),
+          filters_applied: { agent: agent || null, limit },
+          summary: {
+            leads_total: leadsTotal,
+            active_deals: activeTx.length,
+            overdue_tasks: overdueCount,
+            due_today: dueTodayCount,
+            upcoming_week: upcomingCount,
+            stalled_deals: stalledDeals.length,
+            recent_conversations: recentActivity.length,
+            smart_alerts: alertsResult?.total ?? (alertsResult?.alerts?.length || 0)
+          },
+          overdue_checklist: overdueHydrated.map(stripId),
+          today_tasks: todayHydrated.map(stripId),
+          upcoming_tasks: upcomingHydrated.map(stripId),
+          stalled_deals: stalledDeals.map(tx => ({
+            ...stripId(tx),
+            days_inactive: Math.ceil((now - new Date(tx.updated_at)) / (1000 * 60 * 60 * 24))
+          })),
+          recent_leads: recentLeads.map(stripId),
+          recent_activity: recentActivity.map(stripId),
+          smart_alerts: (alertsResult?.alerts || []).map(stripId),
+          next_best_actions: nextBestActions
+        }
+
+        return handleCORS(NextResponse.json(suggestions))
+      } catch (error) {
+        console.error('Assistant suggestions error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to get assistant suggestions'
+        }, { status: 500 }))
+      }
+    }
+    
+    // POST /api/assistant/plan - Generate a time-blocked plan from selected items
+    if (route === '/assistant/plan' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const {
+          selected_keys = [],
+          agent = null,
+          start_time = null,
+          workday_start_hour = 9,
+          workday_end_hour = 17,
+          buffer_min = 5,
+          max_items = 10,
+          roll_to_next_workday = false
+        } = body || {}
+        const now = new Date()
+        const db = await connectToMongo()
+
+        // Build maps/filters
+        const agentFilterTasks = agent ? { assignee: agent } : {}
+
+        // Duration and scoring heuristics (aligned with /assistant/suggestions)
+        const estimateTask = (t) => {
+          const due = new Date(t.due_date)
+          const msLeft = due - now
+          const daysLeft = Math.floor(msLeft / 86400000)
+          const isOverdue = msLeft < 0
+          const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
+          const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
+          const urgency = isOverdue ? 'overdue' : (due && due >= startOfToday && due <= endOfToday ? 'due_today' : 'due_soon')
+          const base = isOverdue ? 92 : (urgency === 'due_today' ? 78 : 65)
+          const timeAdj = isFinite(daysLeft) ? Math.max(-10, Math.min(10, -daysLeft * 2)) : 0
+          const title = String(t.title || 'Task')
+          const lower = title.toLowerCase()
+          let est = 15
+          if (/call|phone|ring/.test(lower)) est = 5
+          else if (/email|text|sms|follow[- ]?up/.test(lower)) est = 8
+          else if (/mls|syndication|listing entry|photos|staging/.test(lower)) est = 30
+          else if (/agreement|contract|disclosure|docu|esign|signature/.test(lower)) est = 15
+          const priority_score = Math.max(0, Math.min(100, base + timeAdj))
+          return { est_duration_min: est, priority_score, urgency }
+        }
+        const estimateAlert = (a) => {
+          const est = 2
+          const priority_score = a.priority === 'urgent' ? 90 : a.priority === 'high' ? 80 : 60
+          return { est_duration_min: est, priority_score, urgency: a.priority === 'urgent' ? 'urgent' : 'normal' }
+        }
+
+        // Build items from selected keys or fallback to top actions
+        let items = []
+
+        if (Array.isArray(selected_keys) && selected_keys.length > 0) {
+          const taskIds = selected_keys.filter(k => k && k.startsWith('task:')).map(k => k.split(':')[1]).filter(Boolean)
+          const alertIds = selected_keys.filter(k => k && k.startsWith('alert:')).map(k => k.split(':')[1]).filter(Boolean)
+
+          const [tasks, alerts] = await Promise.all([
+            taskIds.length ? db.collection('checklist_items').find({ id: { $in: taskIds }, ...agentFilterTasks }).toArray() : [],
+            alertIds.length ? db.collection('smart_alerts').find({ id: { $in: alertIds } }).toArray() : []
+          ])
+
+          // Hydrate with transaction info when available
+          const txIds = [...new Set(tasks.map(t => t.transaction_id).filter(Boolean))]
+          const txMap = new Map()
+          if (txIds.length) {
+            const txList = await db.collection('transactions').find({ id: { $in: txIds } }).toArray()
+            for (const tx of txList) txMap.set(tx.id, tx)
+          }
+
+          for (const t of tasks) {
+            const { est_duration_min, priority_score, urgency } = estimateTask(t)
+            const tx = txMap.get(t.transaction_id)
+            const due = t.due_date ? new Date(t.due_date) : null
+            const labelDue = due ? (due.toDateString() === new Date().toDateString() ? 'today' : `due ${due.toLocaleDateString()}`) : '—'
+            items.push({
+              key: `task:${t.id}`,
+              type: 'task',
+              id: t.id,
+              label: `Complete: ${t.title || 'Task'} (${labelDue})`,
+              client_name: tx?.client_name || t.client_name,
+              property_address: tx?.property_address || t.property_address,
+              transaction_id: t.transaction_id,
+              est_duration_min,
+              priority_score,
+              urgency,
+              reason: t.client_name ? `Client: ${t.client_name}` : undefined
+            })
+          }
+          for (const a of alerts) {
+            const { est_duration_min, priority_score, urgency } = estimateAlert(a)
+            const title = a.message || a.description || a.alert_type || 'Alert'
+            items.push({
+              key: `alert:${a.id}`,
+              type: 'alert',
+              id: a.id,
+              label: `Dismiss alert: ${title}`,
+              est_duration_min,
+              priority_score,
+              urgency,
+              reason: a.alert_type ? `Type: ${a.alert_type}` : 'Smart alert'
+            })
+          }
+        } else {
+          // Fallback: derive tasks up to max_items
+          const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
+          const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
+          const tasks = await db.collection('checklist_items')
+            .find({ status: { $ne: 'completed' }, due_date: { $lte: endOfToday }, ...agentFilterTasks })
+            .sort({ due_date: 1 })
+            .limit(max_items)
+            .toArray()
+          items = tasks.map(t => {
+            const { est_duration_min, priority_score, urgency } = estimateTask(t)
+            const due = t.due_date ? new Date(t.due_date) : null
+            const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : '—'
+            return {
+              key: `task:${t.id}`,
+              type: 'task',
+              id: t.id,
+              label: `Complete: ${t.title || 'Task'} (${labelDue})`,
+              transaction_id: t.transaction_id,
+              est_duration_min,
+              priority_score,
+              urgency,
+              reason: t.client_name ? `Client: ${t.client_name}` : undefined
+            }
+          })
+        }
+
+        // Sort and cap
+        items.sort((a, b) => (b.priority_score || 0) - (a.priority_score || 0))
+        if (items.length > max_items) items = items.slice(0, max_items)
+
+        // Time-blocking within workday
+        const start = (() => {
+          if (start_time) {
+            const dt = new Date(start_time)
+            if (!isNaN(dt)) return dt
+          }
+          const s = new Date(now)
+          const wdStart = new Date(now); wdStart.setHours(workday_start_hour, 0, 0, 0)
+          return s < wdStart ? wdStart : s
+        })()
+        let workEnd = new Date(start); workEnd.setHours(workday_end_hour, 0, 0, 0)
+        // If we are after work hours and asked to roll, push to next day window
+        if (roll_to_next_workday && workEnd <= start) {
+          const next = new Date(start)
+          next.setDate(next.getDate() + 1)
+          next.setHours(workday_start_hour, 0, 0, 0)
+          // Advance start and workEnd to next workday
+          start.setTime(next.getTime())
+          workEnd = new Date(start); workEnd.setHours(workday_end_hour, 0, 0, 0)
+        }
+        let cursor = new Date(start)
+        const scheduled = []
+        const overflow = []
+        for (const it of items) {
+          const dur = Math.max(1, Number(it.est_duration_min || 10))
+          const end = new Date(cursor.getTime() + dur * 60000)
+          if (end <= workEnd) {
+            scheduled.push({ ...it, scheduled_start: cursor.toISOString(), scheduled_end: end.toISOString() })
+            cursor = new Date(end.getTime() + buffer_min * 60000)
+          } else {
+            overflow.push({ ...it })
+          }
+        }
+        const planItems = [...scheduled, ...overflow]
+
+        const totalDuration = scheduled.reduce((sum, i) => sum + (i.est_duration_min || 0), 0)
+        const response = {
+          success: true,
+          plan: {
+            date: new Date(start).toISOString().slice(0,10),
+            started_at: start.toISOString(),
+            ends_at: workEnd.toISOString(),
+            total_items: planItems.length,
+            scheduled_items: scheduled.length,
+            total_duration_min: totalDuration
+          },
+          items: planItems
+        }
+        return handleCORS(NextResponse.json(response))
+      } catch (error) {
+        console.error('Assistant plan error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to build plan' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/assistant/plan/save - Persist a generated plan to the database
+    if (route === '/assistant/plan/save' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const {
+          agent = null,
+          plan = {},
+          items = [],
+          title = null,
+          calendar_export = null
+        } = body || {}
+        const db = await connectToMongo()
+
+        const doc = {
+          id: uuidv4(),
+          agent,
+          title: title || `Plan ${new Date().toLocaleDateString()}`,
+          plan,
+          items,
+          calendar_export: calendar_export || null,
+          created_at: new Date(),
+          updated_at: new Date()
+        }
+
+        await db.collection('assistant_plans').insertOne(doc)
+
+        return handleCORS(NextResponse.json({ success: true, plan_id: doc.id }))
+      } catch (error) {
+        console.error('Assistant plan save error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to save plan' }, { status: 500 }))
+      }
+    }
+
+    // GET /api/assistant/stream - Server-Sent Events stream for real-time updates
+    if (route === '/assistant/stream' && method === 'GET') {
+      try {
+        const stream = new ReadableStream({
+          start(controller) {
+            const g = globalThis
+            if (!g.__crmSSE) g.__crmSSE = { clients: new Set() }
+            g.__crmSSE.clients.add(controller)
+            // Initial event
+            try { controller.enqueue(`event: ready\ndata: {"ts": ${Date.now()}}\n\n`) } catch (_) {}
+            const pingId = setInterval(() => {
+              try { controller.enqueue(`event: ping\ndata: ${Date.now()}\n\n`) } catch (_) {}
+            }, 15000)
+            controller._cleanup = () => {
+              clearInterval(pingId)
+              try { g.__crmSSE.clients.delete(controller) } catch (_) {}
+              try { controller.close() } catch (_) {}
+            }
+          },
+          cancel() { try { this._cleanup && this._cleanup() } catch (_) {} }
+        })
+        const res = new Response(stream, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache'
+          }
+        })
+        return handleCORS(res)
+      } catch (error) {
+        console.error('SSE stream error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'SSE stream failed' }, { status: 500 }))
+      }
+    }
+
     // OPENAI UTILITIES ENDPOINTS
     
     // GET /api/openai/usage - Get OpenAI usage statistics
@@ -2700,6 +5226,127 @@ async function handleRoute(request, { params }) {
       return handleCORS(NextResponse.json(stats))
     }
 
+    // --- Notifications API ---
+    // GET /api/notifications
+    if (route === '/notifications' && method === 'GET') {
+      try {
+        const url = new URL(request.url)
+        const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')) || 50))
+        const countOnly = url.searchParams.get('countOnly') === '1'
+        const coll = (await connectToMongo()).collection('notifications')
+        if (countOnly) {
+          const total = await coll.countDocuments()
+          const unread = await coll.countDocuments({ status: 'unread' })
+          return handleCORS(NextResponse.json({ success: true, total, unread }))
+        }
+        const items = await coll.find({}).sort({ created_at: -1 }).limit(limit).toArray()
+        return handleCORS(NextResponse.json({ success: true, items: items.map(({ _id, ...rest }) => rest) }))
+      } catch (e) {
+        console.error('Notifications list error', e)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to list notifications' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/notifications (create)
+    if (route === '/notifications' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const notif = {
+          id: uuidv4(),
+          type: body.type || 'general',
+          title: body.title || null,
+          message: body.message || body.description || '',
+          meta: body.meta || {},
+          status: 'unread',
+          created_at: new Date(),
+          updated_at: new Date(),
+          snooze_until: null
+        }
+        const coll = (await connectToMongo()).collection('notifications')
+        await coll.insertOne(notif)
+        // SSE broadcast
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('notifications:changed', { action: 'created', id: notif.id })) } catch {} }
+          }
+        } catch (_) {}
+        return handleCORS(NextResponse.json({ success: true, notification: notif }, { status: 201 }))
+      } catch (e) {
+        console.error('Notifications create error', e)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to create notification' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/notifications/:id/read
+    if (route.match(/^\/notifications\/[^\/]+\/read$/) && method === 'POST') {
+      try {
+        const id = path[1]
+        const coll = (await connectToMongo()).collection('notifications')
+        await coll.updateOne({ id }, { $set: { status: 'read', updated_at: new Date() } })
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('notifications:changed', { action: 'read', id })) } catch {} }
+          }
+        } catch (_) {}
+        return handleCORS(NextResponse.json({ success: true }))
+      } catch (e) {
+        console.error('Notifications read error', e)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to mark read' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/notifications/:id/snooze
+    if (route.match(/^\/notifications\/[^\/]+\/snooze$/) && method === 'POST') {
+      try {
+        const id = path[1]
+        const body = await request.json().catch(() => ({}))
+        const minutes = Math.max(1, Number(body.minutes) || 30)
+        const until = new Date(Date.now() + minutes * 60 * 1000)
+        const coll = (await connectToMongo()).collection('notifications')
+        await coll.updateOne({ id }, { $set: { status: 'snoozed', snooze_until: until, updated_at: new Date() } })
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('notifications:changed', { action: 'snoozed', id, until })) } catch {} }
+          }
+        } catch (_) {}
+        return handleCORS(NextResponse.json({ success: true }))
+      } catch (e) {
+        console.error('Notifications snooze error', e)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to snooze' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/notifications/clear-read
+    if (route === '/notifications/clear-read' && method === 'POST') {
+      try {
+        const coll = (await connectToMongo()).collection('notifications')
+        // Prefer deleteMany, fallback to manual loop if unavailable
+        if (typeof coll.deleteMany === 'function') {
+          await coll.deleteMany({ status: 'read' })
+        } else {
+          const all = await coll.find({}).toArray()
+          for (const n of all) { if (n.status === 'read') { try { await coll.deleteOne({ id: n.id }) } catch {} } }
+        }
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('notifications:changed', { action: 'clear_read' })) } catch {} }
+          }
+        } catch (_) {}
+        return handleCORS(NextResponse.json({ success: true }))
+      } catch (e) {
+        console.error('Notifications clear-read error', e)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to clear read' }, { status: 500 }))
+      }
+    }
+
     // Route not found
     return handleCORS(NextResponse.json(
       { error: `Route ${route} not found` }, 
@@ -2713,6 +5360,175 @@ async function handleRoute(request, { params }) {
       { status: 500 }
     ))
   }
+}
+
+// --- Nudge Scheduler (Proactive AI Nudges) ---
+if (!globalThis.__crmNudgeScheduler) {
+  const pushSSE = (evt, payload) => {
+    try {
+      const g = globalThis
+      if (!g.__crmSSE || !g.__crmSSE.clients) return
+      const json = JSON.stringify(payload)
+      for (const c of g.__crmSSE.clients) {
+        try { c.enqueue(`event: ${evt}\ndata: ${json}\n\n`) } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  const runNudgeScan = async () => {
+    try {
+      const db = await connectToMongo()
+      const now = new Date()
+
+      // Overdue checklist tasks
+      const overdueTasks = await db.collection('checklist').find({
+        status: { $ne: 'completed' },
+        due_date: { $lte: now }
+      }).limit(5).toArray()
+
+      for (const t of overdueTasks) {
+        const payload = {
+          id: `task_${t.id || t._id}`,
+          type: 'checklist_slip',
+          message: `Task overdue: ${t.title || 'Unnamed task'}`,
+          quickAction: { type: 'complete_task', id: t.id || t._id }
+        }
+        pushSSE('nudge', payload)
+        // Persist as a notification (dedupe per hour)
+        try {
+          const coll = db.collection('notifications')
+          const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
+          const exists = await coll.findOne({ id: nid })
+          if (!exists) {
+            await coll.insertOne({
+              id: nid,
+              type: 'nudge',
+              title: 'Overdue task',
+              message: payload.message,
+              meta: payload,
+              status: 'unread',
+              created_at: new Date(),
+              updated_at: new Date(),
+              snooze_until: null
+            })
+          }
+        } catch (_) {}
+      }
+
+      // Stalled deals (no update in 7 days)
+      const seven = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+      const stalled = await db.collection('transactions').find({
+        status: { $in: ['active', 'open', 'in_progress'] },
+        updated_at: { $lte: seven }
+      }).limit(3).toArray()
+
+      for (const tx of stalled) {
+        const days = Math.ceil((now - new Date(tx.updated_at)) / 86400000)
+        const payload = {
+          id: `deal_${tx.id || tx._id}`,
+          type: 'stalled_deal',
+          message: `Deal \"${tx.title || tx.property_address || 'Untitled'}\" stalled for ${days} days.`
+        }
+        pushSSE('nudge', payload)
+        // Persist as a notification (dedupe per hour)
+        try {
+          const coll = db.collection('notifications')
+          const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
+          const exists = await coll.findOne({ id: nid })
+          if (!exists) {
+            await coll.insertOne({
+              id: nid,
+              type: 'nudge',
+              title: 'Stalled deal',
+              message: payload.message,
+              meta: payload,
+              status: 'unread',
+              created_at: new Date(),
+              updated_at: new Date(),
+              snooze_until: null
+            })
+          }
+        } catch (_) {}
+      }
+
+      // Fresh leads (last hour)
+      const hourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+      const leads = await db.collection('leads').find({ created_at: { $gte: hourAgo } }).limit(3).toArray()
+      for (const lead of leads) {
+        const payload = {
+          id: `lead_${lead.id || lead._id}`,
+          type: 'new_lead',
+          message: `New lead: ${lead.name || lead.full_name || 'Prospect'}`,
+          quickAction: { type: 'open_lead', id: lead.id || lead._id }
+        }
+        pushSSE('nudge', payload)
+        // Persist as a notification (dedupe per hour)
+        try {
+          const coll = db.collection('notifications')
+          const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
+          const exists = await coll.findOne({ id: nid })
+          if (!exists) {
+            await coll.insertOne({
+              id: nid,
+              type: 'nudge',
+              title: 'New lead',
+              message: payload.message,
+              meta: payload,
+              status: 'unread',
+              created_at: new Date(),
+              updated_at: new Date(),
+              snooze_until: null
+            })
+          }
+        } catch (_) {}
+      }
+
+      // Notify panels to refresh suggestions summary
+      pushSSE('suggestions:update', { ts: Date.now() })
+    } catch (e) {
+      console.warn('Nudge scan error', e)
+    }
+  }
+
+  // Kick off immediately then every 30 min
+  runNudgeScan()
+  globalThis.__crmNudgeScheduler = setInterval(runNudgeScan, 30 * 60 * 1000)
+}
+
+// --- Snooze Wake-up Scheduler (auto-unsnooze reminders) ---
+if (!globalThis.__crmSnoozeScheduler) {
+  const pushSSE = (evt, payload) => {
+    try {
+      const g = globalThis
+      if (g.__crmSSE?.clients) {
+        const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+        for (const c of g.__crmSSE.clients) { try { c.enqueue(msg(evt, payload)) } catch {} }
+      }
+    } catch (_) {}
+  }
+
+  const runSnoozeScan = async () => {
+    try {
+      const db = await connectToMongo()
+      const coll = db.collection('notifications')
+      const now = new Date()
+      // Find all snoozed notifications that are due to wake up
+      const due = await coll.find({ status: 'snoozed', snooze_until: { $lte: now } }).toArray()
+      for (const n of due) {
+        await coll.updateOne({ id: n.id }, { $set: { status: 'unread', snooze_until: null, updated_at: new Date() } })
+        // Inform clients to refresh counters/lists
+        try { pushSSE('notifications:changed', { action: 'unsnoozed', id: n.id }) } catch {}
+        // Proactively remind the user with a payload (toast/browser notification on client)
+        try { pushSSE('notifications:remind', { id: n.id, type: n.type, title: n.title || 'Reminder', message: n.message, meta: n.meta || {} }) } catch {}
+      }
+    } catch (e) {
+      console.warn('Snooze scan error', e)
+    }
+  }
+
+  // Kick off immediately then every minute
+  runSnoozeScan()
+  globalThis.__crmSnoozeScheduler = setInterval(runSnoozeScan, 60 * 1000)
 }
 
 // Export all HTTP methods

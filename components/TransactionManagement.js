@@ -8,6 +8,17 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { toast } from '@/hooks/use-toast'
 import { 
   Plus, 
   Home, 
@@ -19,15 +30,27 @@ import {
   Clock,
   CheckCircle,
   PlayCircle,
-  Search
+  Search,
+  Trash2
 } from 'lucide-react'
 import { TransactionTimeline } from '@/components/TransactionTimeline'
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 
-const STAGE_CONFIG = {
-  pre_listing: { name: 'Pre-Listing', color: 'bg-blue-500', icon: FileText },
-  listing: { name: 'Active Listing', color: 'bg-yellow-500', icon: PlayCircle },
-  under_contract: { name: 'Under Contract', color: 'bg-orange-500', icon: Clock },
-  escrow_closing: { name: 'Escrow & Closing', color: 'bg-green-500', icon: CheckCircle }
+// Stage configurations for seller (sale) and buyer (purchase)
+const STAGE_CONFIGS = {
+  sale: {
+    pre_listing: { name: 'Pre-Listing', color: 'bg-blue-500', icon: FileText },
+    listing: { name: 'Active Listing', color: 'bg-yellow-500', icon: PlayCircle },
+    under_contract: { name: 'Under Contract', color: 'bg-orange-500', icon: Clock },
+    escrow_closing: { name: 'Escrow & Closing', color: 'bg-green-500', icon: CheckCircle }
+  },
+  purchase: {
+    pre_approval: { name: 'Pre-Approval', color: 'bg-blue-500', icon: FileText },
+    home_search: { name: 'Home Search', color: 'bg-purple-500', icon: PlayCircle },
+    offer: { name: 'Offer', color: 'bg-yellow-500', icon: FileText },
+    under_contract: { name: 'Under Contract', color: 'bg-orange-500', icon: Clock },
+    escrow_closing: { name: 'Escrow & Closing', color: 'bg-green-500', icon: CheckCircle }
+  }
 }
 
 export function TransactionManagement() {
@@ -38,6 +61,8 @@ export function TransactionManagement() {
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [stageFilter, setStageFilter] = useState('all')
+  const [deleteDialog, setDeleteDialog] = useState({ open: false, tx: null })
+  const [deleting, setDeleting] = useState(false)
 
   const [newTransaction, setNewTransaction] = useState({
     property_address: '',
@@ -142,6 +167,30 @@ export function TransactionManagement() {
     return new Date(date).toLocaleDateString()
   }
 
+  const openDeleteDialog = (tx, e) => {
+    if (e) e.stopPropagation()
+    setDeleteDialog({ open: true, tx })
+  }
+
+  const handleDelete = async () => {
+    if (!deleteDialog.tx) return
+    setDeleting(true)
+    try {
+      const res = await fetch(`/api/transactions/${deleteDialog.tx.id}`, { method: 'DELETE' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.success) {
+        throw new Error(data?.error || 'Failed to delete transaction')
+      }
+      setTransactions((prev) => prev.filter((t) => t.id !== deleteDialog.tx.id))
+      toast({ title: 'Transaction deleted', description: `${deleteDialog.tx.property_address} removed.` })
+      setDeleteDialog({ open: false, tx: null })
+    } catch (err) {
+      toast({ title: 'Delete failed', description: err.message || 'Please try again.' })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   if (selectedTransaction) {
     return (
       <div className="space-y-6">
@@ -192,9 +241,16 @@ export function TransactionManagement() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All Stages</SelectItem>
-            {Object.entries(STAGE_CONFIG).map(([key, stage]) => (
-              <SelectItem key={key} value={key}>{stage.name}</SelectItem>
-            ))}
+            {/* Show union of sale + purchase stages */}
+            {Array.from(new Set([
+              ...Object.keys(STAGE_CONFIGS.sale),
+              ...Object.keys(STAGE_CONFIGS.purchase)
+            ])).map((key) => {
+              const stage = STAGE_CONFIGS.sale[key] || STAGE_CONFIGS.purchase[key]
+              return (
+                <SelectItem key={key} value={key}>{stage.name}</SelectItem>
+              )
+            })}
           </SelectContent>
         </Select>
       </div>
@@ -210,7 +266,8 @@ export function TransactionManagement() {
       ) : filteredTransactions.length > 0 ? (
         <div className="grid gap-6">
           {filteredTransactions.map((transaction) => {
-            const stageConfig = STAGE_CONFIG[transaction.current_stage] || {}
+            const tType = transaction.transaction_type || 'sale'
+            const stageConfig = (STAGE_CONFIGS[tType] && STAGE_CONFIGS[tType][transaction.current_stage]) || {}
             const StageIcon = stageConfig.icon || FileText
             
             return (
@@ -224,9 +281,9 @@ export function TransactionManagement() {
                           <h3 className="text-lg font-semibold">{transaction.property_address}</h3>
                           <p className="text-muted-foreground">Client: {transaction.client_name}</p>
                         </div>
-                        <Badge className={`${stageConfig.color} text-white`}>
+                        <Badge className={`${stageConfig.color || 'bg-gray-500'} text-white`}>
                           <StageIcon className="mr-1 h-3 w-3" />
-                          {stageConfig.name}
+                          {stageConfig.name || transaction.current_stage}
                         </Badge>
                       </div>
                       
@@ -265,9 +322,27 @@ export function TransactionManagement() {
                       )}
                     </div>
                     
-                    <Button variant="ghost" size="sm">
-                      <ArrowRight className="h-4 w-4" />
-                    </Button>
+                    <div className="flex items-center gap-1 sm:gap-2">
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="text-destructive hover:bg-destructive/10"
+                              onClick={(e) => openDeleteDialog(transaction, e)}
+                              aria-label="Delete transaction"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Delete</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                      <Button variant="ghost" size="icon" aria-label="Open">
+                        <ArrowRight className="h-4 w-4" />
+                      </Button>
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -415,6 +490,24 @@ export function TransactionManagement() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <AlertDialog open={deleteDialog.open} onOpenChange={(open) => setDeleteDialog((prev) => ({ ...prev, open }))}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this transaction?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently remove the transaction{deleteDialog.tx ? ` for ${deleteDialog.tx.property_address}` : ''} and its checklist items. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDelete} disabled={deleting}>
+              {deleting ? 'Deleting...' : 'Delete'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

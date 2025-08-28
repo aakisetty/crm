@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
+import { MarkdownText } from '@/components/ui/markdown'
 import { 
   Bot, 
   Send, 
@@ -21,8 +22,11 @@ import {
   UserPlus,
   CheckCircle,
   AlertCircle,
-  Loader2
+  Loader2,
+  FileText
 } from 'lucide-react'
+
+import ChatPropertyResults from '@/components/ChatPropertyResults'
 
 export function AssistantChat() {
   const [messages, setMessages] = useState([
@@ -37,12 +41,14 @@ export function AssistantChat() {
   const [isLoading, setIsLoading] = useState(false)
 
   const formatCurrency = (amount) => {
-    if (!amount) return 'N/A'
+    if (amount === null || amount === undefined || amount === '') return 'N/A'
+    const n = Number(amount)
+    if (Number.isNaN(n)) return 'N/A'
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
       minimumFractionDigits: 0,
-    }).format(amount)
+    }).format(n)
   }
 
   const handleSendMessage = async () => {
@@ -62,63 +68,14 @@ export function AssistantChat() {
     setInputMessage('')
 
     try {
-      // Step 1: Parse the message with timeout
-      console.log('Sending parse request with message:', currentInput)
-      
-      const parseController = new AbortController()
-      const parseTimeout = setTimeout(() => parseController.abort(), 30000) // 30 second timeout
-
-      const parseResponse = await fetch('/api/assistant/parse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: currentInput }),
-        signal: parseController.signal
-      })
-
-      clearTimeout(parseTimeout)
-
-      console.log('Parse response status:', parseResponse.status, parseResponse.statusText)
-
-      if (!parseResponse.ok) {
-        const errorText = await parseResponse.text()
-        console.error('Parse API error response:', errorText)
-        throw new Error(`Parse API failed: ${parseResponse.status} ${parseResponse.statusText} - ${errorText}`)
-      }
-
-      let parseData
-      try {
-        const responseText = await parseResponse.text()
-        console.log('Parse response text:', responseText)
-        
-        if (!responseText.trim()) {
-          throw new Error('Empty response from parse API')
-        }
-        parseData = JSON.parse(responseText)
-        console.log('Parse data:', parseData)
-      } catch (jsonError) {
-        console.error('Parse response JSON error:', jsonError)
-        throw new Error('Invalid response format from parse API')
-      }
-
-      if (!parseData || !parseData.success) {
-        console.error('Parse data indicates failure:', parseData)
-        throw new Error(parseData?.error || 'Failed to parse message')
-      }
-
-      // Step 2: Match leads and properties with timeout
-      console.log('Sending match request with parsed data:', parseData.parsed_data)
-      
+      // Single-step: let backend self-parse and fulfill
       const matchController = new AbortController()
-      const matchTimeout = setTimeout(() => matchController.abort(), 30000) // 30 second timeout
+      const matchTimeout = setTimeout(() => matchController.abort(), 30000)
 
       const matchResponse = await fetch('/api/assistant/match', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parsed_data: parseData.parsed_data,
-          original_message: currentInput,
-          agent_name: 'Agent Smith'
-        }),
+        body: JSON.stringify({ query: currentInput }),
         signal: matchController.signal
       })
 
@@ -156,14 +113,17 @@ export function AssistantChat() {
       const assistantMessage = {
         id: (Date.now() + 1).toString(),
         type: 'assistant',
-        content: matchData.ai_recommendations || 'I\'ve processed your request successfully.',
+        content: matchData.answer || matchData.ai_recommendations || 'I\'ve processed your request successfully.',
         timestamp: new Date(),
         data: {
           lead: matchData.lead,
           isNewLead: matchData.is_new_lead,
           properties: matchData.properties || [],
           propertiesCount: matchData.properties_count || 0,
-          summary: matchData.summary
+          summary: matchData.summary,
+          transactions: matchData.transactions || [],
+          tasks: matchData.tasks || [],
+          alerts: matchData.alerts || []
         }
       }
 
@@ -178,8 +138,6 @@ export function AssistantChat() {
         errorMsg = 'Request timed out. The AI processing is taking longer than expected. Please try with a shorter message.'
       } else if (error.message.includes('502') || error.message.includes('Bad Gateway')) {
         errorMsg = '🔧 **Infrastructure Issue Detected**\n\nThe AI Assistant backend is fully functional, but there\'s a proxy configuration issue preventing external API access. \n\n**What works**: All APIs on localhost:3000 ✅\n**Issue**: External proxy routing for /api/* endpoints ❌\n\n**For immediate testing**, you can verify the AI works by running:\n```bash\ncurl -X POST http://localhost:3000/api/assistant/parse \\\n  -H "Content-Type: application/json" \\\n  -d \'{"message": "Met Sarah, 2BHK in Austin under $350K"}\'\n```\n\n**Status**: Waiting for proxy configuration fix to enable full functionality.'
-      } else if (error.message.includes('Parse API failed')) {
-        errorMsg = 'Failed to understand your message. Please try rephrasing it.'
       } else if (error.message.includes('Match API failed')) {
         errorMsg = 'Failed to process your request. Please try again.'
       } else {
@@ -222,46 +180,135 @@ export function AssistantChat() {
       </div>
 
       {/* Chat Messages */}
-      <ScrollArea className="flex-1 p-4">
+      <ScrollArea native className="flex-1 p-4 pr-6 md:pr-8">
         <div className="space-y-4">
           {messages.map((message) => (
-            <div key={message.id} className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`flex items-start space-x-2 max-w-[80%] ${message.type === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
+            <div key={message.id} className={`flex w-full ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`flex items-start space-x-2 min-w-0 ${message.type === 'user' ? 'max-w-[80%] flex-row-reverse space-x-reverse' : 'max-w-[96%] overflow-x-visible mr-4 md:mr-6'}`}>
                 <Avatar className="h-6 w-6 mt-1">
                   <AvatarFallback className={`text-xs ${message.type === 'user' ? 'bg-primary text-primary-foreground' : 'bg-muted'}`}>
                     {message.type === 'user' ? <User className="h-3 w-3" /> : <Bot className="h-3 w-3" />}
                   </AvatarFallback>
                 </Avatar>
                 
-                <div className="space-y-2">
-                  <div className={`rounded-lg p-3 ${
+                <div className="space-y-2 flex-1 min-w-0">
+                  <div className={`rounded-lg p-3 pr-6 md:pr-8 break-words min-w-0 ${
                     message.type === 'user' 
                       ? 'bg-primary text-primary-foreground' 
                       : message.isError
                         ? 'bg-destructive/10 text-destructive border border-destructive/20'
                         : 'bg-muted'
                   }`}>
-                    <p className="text-sm whitespace-pre-line">{message.content}</p>
+                    {message.type === 'assistant' ? (
+                      <MarkdownText text={message.content} className="text-sm break-words" />
+                    ) : (
+                      <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
+                    )}
                   </div>
 
                   {/* Results Display */}
                   {message.data && (
-                    <div className="space-y-3">
+                    <div className="space-y-3 pr-6 md:pr-8 overflow-x-visible">
+                      {/* Transactions Status */}
+                      {message.data.transactions && message.data.transactions.length > 0 && (
+                        <Card className="bg-background">
+                          <CardHeader className="pb-2 pr-4 md:pr-6">
+                            <CardTitle className="text-sm flex items-center">
+                              <FileText className="mr-2 h-4 w-4 text-blue-600" />
+                              Transactions Status
+                            </CardTitle>
+                          </CardHeader>
+                          <CardContent className="pt-0 pr-4 md:pr-6 space-y-2">
+                            {message.data.transactions.slice(0,5).map((t, idx) => (
+                              <div key={idx} className="text-sm">
+                                <div className="font-medium">{t.title || t.property_address || t.address || `Deal ${t.id}`}</div>
+                                <div className="text-muted-foreground">Stage: {t.current_stage || 'n/a'}</div>
+                                {t.next_tasks && t.next_tasks.length > 0 && (
+                                  <div className="text-muted-foreground">Next: {t.next_tasks[0].title}</div>
+                                )}
+                              </div>
+                            ))}
+                          </CardContent>
+                        </Card>
+                      )}
+
+                      {/* Tasks Lists */}
+                      {message.data.tasks && message.data.tasks.length > 0 && (
+                        <Card className="bg-background">
+                          <CardHeader className="pb-2 pr-4 md:pr-6">
+                            <CardTitle className="text-sm flex items-center">
+                              <CheckCircle className="mr-2 h-4 w-4 text-green-600" />
+                              Tasks
+                            </CardTitle>
+                          </CardHeader>
+                          <CardContent className="pt-0 pr-4 md:pr-6 space-y-2">
+                            {message.data.tasks.slice(0,5).map((t, idx) => (
+                              <div key={idx} className="flex items-center justify-between text-sm">
+                                <div>
+                                  <div className="font-medium">{t.title}</div>
+                                  <div className="text-muted-foreground">Due: {t.due_date ? new Date(t.due_date).toLocaleString() : '—'}</div>
+                                </div>
+                                {t.id && (
+                                  <Button size="sm" variant="outline" onClick={async () => {
+                                    try {
+                                      const res = await fetch(`/api/checklist/${t.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'completed' }) })
+                                      if (res.ok) {
+                                        // Optimistic UI update
+                                        t.status = 'completed'
+                                      }
+                                    } catch {}
+                                  }}>Complete</Button>
+                                )}
+                              </div>
+                            ))}
+                          </CardContent>
+                        </Card>
+                      )}
+
+                      {/* Alerts */}
+                      {message.data.alerts && message.data.alerts.length > 0 && (
+                        <Card className="bg-background">
+                          <CardHeader className="pb-2 pr-4 md:pr-6">
+                            <CardTitle className="text-sm flex items-center">
+                              <AlertCircle className="mr-2 h-4 w-4 text-amber-600" />
+                              Alerts
+                            </CardTitle>
+                          </CardHeader>
+                          <CardContent className="pt-0 pr-4 md:pr-6 space-y-2">
+                            {message.data.alerts.slice(0,5).map((a, idx) => (
+                              <div key={idx} className="flex items-center justify-between text-sm">
+                                <div>
+                                  <div className="font-medium">{a.title || a.type}</div>
+                                  <div className="text-muted-foreground">Priority: {a.priority || 'normal'}</div>
+                                </div>
+                                {a.id && (
+                                  <Button size="sm" variant="outline" onClick={async () => {
+                                    try {
+                                      await fetch(`/api/alerts/dismiss/${a.id}`, { method: 'POST' })
+                                    } catch {}
+                                  }}>Dismiss</Button>
+                                )}
+                              </div>
+                            ))}
+                          </CardContent>
+                        </Card>
+                      )}
+
                       {/* Lead Information */}
                       {message.data.lead && (
                         <Card className="bg-background">
-                          <CardHeader className="pb-2">
-                            <div className="flex items-center justify-between">
+                          <CardHeader className="pb-2 pr-4 md:pr-6">
+                            <div className="flex items-center justify-between gap-2">
                               <CardTitle className="text-sm flex items-center">
                                 {message.data.isNewLead ? <UserPlus className="mr-2 h-4 w-4 text-green-600" /> : <CheckCircle className="mr-2 h-4 w-4 text-blue-600" />}
                                 {message.data.isNewLead ? 'New Lead Created' : 'Existing Lead Found'}
                               </CardTitle>
-                              <Badge variant={message.data.lead.lead_type === 'buyer' ? 'default' : 'secondary'}>
+                              <Badge className="shrink-0" variant={message.data.lead.lead_type === 'buyer' ? 'default' : 'secondary'}>
                                 {message.data.lead.lead_type}
                               </Badge>
                             </div>
                           </CardHeader>
-                          <CardContent className="pt-0">
+                          <CardContent className="pt-0 pr-4 md:pr-6">
                             <div className="space-y-2">
                               <p className="font-medium">{message.data.lead.name}</p>
                               <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
@@ -270,21 +317,65 @@ export function AssistantChat() {
                               </div>
                               {message.data.lead.preferences && Object.keys(message.data.lead.preferences).length > 0 && (
                                 <div className="mt-2 p-2 bg-muted rounded text-sm">
-                                  <strong>Preferences:</strong>
-                                  <div className="grid grid-cols-2 gap-1 mt-1">
-                                    {message.data.lead.preferences.zipcode && (
-                                      <span><MapPin className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.zipcode}</span>
-                                    )}
-                                    {message.data.lead.preferences.bedrooms && (
-                                      <span><Bed className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.bedrooms} bed</span>
-                                    )}
-                                    {message.data.lead.preferences.min_price && (
-                                      <span><DollarSign className="inline h-3 w-3 mr-1" />Min: {formatCurrency(message.data.lead.preferences.min_price)}</span>
-                                    )}
-                                    {message.data.lead.preferences.max_price && (
-                                      <span><DollarSign className="inline h-3 w-3 mr-1" />Max: {formatCurrency(message.data.lead.preferences.max_price)}</span>
-                                    )}
-                                  </div>
+                                  <strong>{message.data.lead.lead_type === 'seller' ? 'Seller Details:' : 'Preferences:'}</strong>
+                                  {message.data.lead.lead_type === 'seller' ? (
+                                    <div className="grid grid-cols-2 gap-1 mt-1">
+                                      {(message.data.lead.preferences.seller_address || message.data.lead.preferences.address) && (
+                                        <span><MapPin className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.seller_address || message.data.lead.preferences.address}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_price ?? message.data.lead.preferences.asking_price) != null && (
+                                        <span><DollarSign className="inline h-3 w-3 mr-1" />Ask: {formatCurrency(message.data.lead.preferences.seller_price ?? message.data.lead.preferences.asking_price)}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_property_type || message.data.lead.preferences.property_type) && (
+                                        <span><Home className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.seller_property_type || message.data.lead.preferences.property_type}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_bedrooms || message.data.lead.preferences.bedrooms) && (
+                                        <span><Bed className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.seller_bedrooms || message.data.lead.preferences.bedrooms} bed</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_bathrooms || message.data.lead.preferences.bathrooms) && (
+                                        <span><Bath className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.seller_bathrooms || message.data.lead.preferences.bathrooms} bath</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_year_built || message.data.lead.preferences.year_built) && (
+                                        <span>Year: {message.data.lead.preferences.seller_year_built || message.data.lead.preferences.year_built}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_square_feet || message.data.lead.preferences.square_feet) && (
+                                        <span><Square className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.seller_square_feet || message.data.lead.preferences.square_feet} sqft</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_lot_size || message.data.lead.preferences.lot_size) && (
+                                        <span>Lot: {message.data.lead.preferences.seller_lot_size || message.data.lead.preferences.lot_size}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_condition || message.data.lead.preferences.condition) && (
+                                        <span>Condition: {message.data.lead.preferences.seller_condition || message.data.lead.preferences.condition}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_occupancy || message.data.lead.preferences.occupancy) && (
+                                        <span>Occupancy: {message.data.lead.preferences.seller_occupancy || message.data.lead.preferences.occupancy}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_timeline || message.data.lead.preferences.timeline) && (
+                                        <span>Timeline: {message.data.lead.preferences.seller_timeline || message.data.lead.preferences.timeline}</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_hoa_fee != null || message.data.lead.preferences.hoa_fee != null) && (
+                                        <span>HOA: {formatCurrency((message.data.lead.preferences.seller_hoa_fee ?? message.data.lead.preferences.hoa_fee) || 0)}/mo</span>
+                                      )}
+                                      {(message.data.lead.preferences.seller_description || message.data.lead.preferences.description || message.data.lead.preferences.notes) && (
+                                        <span className="col-span-2">Notes: {message.data.lead.preferences.seller_description || message.data.lead.preferences.description || message.data.lead.preferences.notes}</span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <div className="grid grid-cols-2 gap-1 mt-1">
+                                      {message.data.lead.preferences.zipcode && (
+                                        <span><MapPin className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.zipcode}</span>
+                                      )}
+                                      {message.data.lead.preferences.bedrooms && (
+                                        <span><Bed className="inline h-3 w-3 mr-1" />{message.data.lead.preferences.bedrooms} bed</span>
+                                      )}
+                                      {message.data.lead.preferences.min_price && (
+                                        <span><DollarSign className="inline h-3 w-3 mr-1" />Min: {formatCurrency(message.data.lead.preferences.min_price)}</span>
+                                      )}
+                                      {message.data.lead.preferences.max_price && (
+                                        <span><DollarSign className="inline h-3 w-3 mr-1" />Max: {formatCurrency(message.data.lead.preferences.max_price)}</span>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -294,58 +385,10 @@ export function AssistantChat() {
 
                       {/* Properties Results */}
                       {message.data.properties && message.data.properties.length > 0 && (
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between">
-                            <p className="text-sm font-medium">Found {message.data.propertiesCount} properties</p>
-                            <Badge variant="outline">{message.data.properties.length} shown</Badge>
-                          </div>
-                          
-                          <div className="space-y-2 max-h-64 overflow-y-auto">
-                            {message.data.properties.slice(0, 3).map((property, index) => (
-                              <Card key={index} className="bg-background">
-                                <CardContent className="p-3">
-                                  <div className="flex justify-between items-start">
-                                    <div className="space-y-1">
-                                      <p className="font-medium text-sm">
-                                        {property.address || `Property #${index + 1}`}
-                                      </p>
-                                      <p className="text-xs text-muted-foreground">
-                                        {property.city}, {property.state} {property.zipcode}
-                                      </p>
-                                      <div className="flex gap-3 text-xs text-muted-foreground">
-                                        {property.bedrooms && (
-                                          <span className="flex items-center">
-                                            <Bed className="mr-1 h-3 w-3" />
-                                            {property.bedrooms}
-                                          </span>
-                                        )}
-                                        {property.bathrooms && (
-                                          <span className="flex items-center">
-                                            <Bath className="mr-1 h-3 w-3" />
-                                            {property.bathrooms}
-                                          </span>
-                                        )}
-                                        {property.square_feet && (
-                                          <span className="flex items-center">
-                                            <Square className="mr-1 h-3 w-3" />
-                                            {property.square_feet} sq ft
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                    {property.price && (
-                                      <div className="text-right">
-                                        <p className="font-bold text-primary text-sm">
-                                          {formatCurrency(property.price)}
-                                        </p>
-                                      </div>
-                                    )}
-                                  </div>
-                                </CardContent>
-                              </Card>
-                            ))}
-                          </div>
-                        </div>
+                        <ChatPropertyResults
+                          properties={message.data.properties}
+                          totalCount={message.data.propertiesCount}
+                        />
                       )}
 
                       {/* No Properties Found */}
@@ -366,7 +409,7 @@ export function AssistantChat() {
           
           {isLoading && (
             <div className="flex justify-start">
-              <div className="flex items-start space-x-2 max-w-[80%]">
+              <div className="flex items-start space-x-2 max-w-[80%] min-w-0">
                 <Avatar className="h-6 w-6 mt-1">
                   <AvatarFallback className="bg-muted">
                     <Bot className="h-3 w-3" />

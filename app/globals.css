@@ -59,39 +59,40 @@ code {
 
 @layer base {
   :root {
-        --background: 0 0% 100%;
-        --foreground: 222.2 84% 4.9%;
+        /* Warm beige dashboard palette with orange primary */
+        --background: 30 40% 96%; /* soft sand */
+        --foreground: 24 22% 20%; /* deep warm gray-brown */
         --card: 0 0% 100%;
-        --card-foreground: 222.2 84% 4.9%;
+        --card-foreground: 24 22% 20%;
         --popover: 0 0% 100%;
-        --popover-foreground: 222.2 84% 4.9%;
-        --primary: 222.2 47.4% 11.2%;
-        --primary-foreground: 210 40% 98%;
-        --secondary: 210 40% 96.1%;
-        --secondary-foreground: 222.2 47.4% 11.2%;
-        --muted: 210 40% 96.1%;
-        --muted-foreground: 215.4 16.3% 46.9%;
-        --accent: 210 40% 96.1%;
-        --accent-foreground: 222.2 47.4% 11.2%;
+        --popover-foreground: 24 22% 20%;
+        --primary: 28 86% 52%; /* orange accent */
+        --primary-foreground: 0 0% 100%;
+        --secondary: 30 35% 92%; /* light sand */
+        --secondary-foreground: 24 22% 20%;
+        --muted: 30 35% 92%;
+        --muted-foreground: 25 15% 40%;
+        --accent: 30 35% 92%;
+        --accent-foreground: 24 22% 20%;
         --destructive: 0 84.2% 60.2%;
         --destructive-foreground: 210 40% 98%;
-        --border: 214.3 31.8% 91.4%;
-        --input: 214.3 31.8% 91.4%;
-        --ring: 222.2 84% 4.9%;
-        --chart-1: 12 76% 61%;
-        --chart-2: 173 58% 39%;
-        --chart-3: 197 37% 24%;
+        --border: 30 20% 88%;
+        --input: 30 20% 88%;
+        --ring: 28 86% 52%;
+        --chart-1: 28 86% 52%;
+        --chart-2: 200 70% 40%;
+        --chart-3: 155 40% 35%;
         --chart-4: 43 74% 66%;
-        --chart-5: 27 87% 67%;
+        --chart-5: 12 76% 61%;
         --radius: 0.5rem;
-        --sidebar-background: 0 0% 98%;
-        --sidebar-foreground: 240 5.3% 26.1%;
-        --sidebar-primary: 240 5.9% 10%;
+        --sidebar-background: 30 40% 96%;
+        --sidebar-foreground: 24 22% 20%;
+        --sidebar-primary: 28 86% 52%;
         --sidebar-primary-foreground: 0 0% 98%;
-        --sidebar-accent: 240 4.8% 95.9%;
-        --sidebar-accent-foreground: 240 5.9% 10%;
-        --sidebar-border: 220 13% 91%;
-        --sidebar-ring: 217.2 91.2% 59.8%;
+        --sidebar-accent: 30 35% 92%;
+        --sidebar-accent-foreground: 24 22% 20%;
+        --sidebar-border: 30 20% 88%;
+        --sidebar-ring: 28 86% 52%;
     }
   .dark {
         --background: 222.2 84% 4.9%;
