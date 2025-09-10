@@ -39,6 +39,8 @@ export function AssistantChat() {
   ])
   const [inputMessage, setInputMessage] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  // Keep track of the lead we are enriching via slot-filling
+  const [currentLeadId, setCurrentLeadId] = useState(null)
 
   const formatCurrency = (amount) => {
     if (amount === null || amount === undefined || amount === '') return 'N/A'
@@ -75,7 +77,7 @@ export function AssistantChat() {
       const matchResponse = await fetch('/api/assistant/match', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: currentInput }),
+        body: JSON.stringify({ query: currentInput, lead_id: currentLeadId || undefined }),
         signal: matchController.signal
       })
 
@@ -123,11 +125,18 @@ export function AssistantChat() {
           summary: matchData.summary,
           transactions: matchData.transactions || [],
           tasks: matchData.tasks || [],
-          alerts: matchData.alerts || []
+          alerts: matchData.alerts || [],
+          requireMoreDetails: !!matchData.require_more_details,
+          missingFields: Array.isArray(matchData.missing_fields) ? matchData.missing_fields : []
         }
       }
 
       setMessages(prev => [...prev, assistantMessage])
+
+      // Persist the lead id for subsequent slot-filling messages
+      if (matchData?.lead?.id) {
+        setCurrentLeadId(matchData.lead.id)
+      }
 
     } catch (error) {
       console.error('Assistant error:', error)
@@ -209,6 +218,23 @@ export function AssistantChat() {
                   {/* Results Display */}
                   {message.data && (
                     <div className="space-y-3 pr-6 md:pr-8 overflow-x-visible">
+                      {/* Missing Fields Prompt for Seller Slot-Filling */}
+                      {message.data.requireMoreDetails && Array.isArray(message.data.missingFields) && message.data.missingFields.length > 0 && (
+                        <Card className="bg-background border-amber-300/60">
+                          <CardHeader className="pb-2 pr-4 md:pr-6">
+                            <CardTitle className="text-sm">Missing Details</CardTitle>
+                          </CardHeader>
+                          <CardContent className="pt-0 pr-4 md:pr-6">
+                            <div className="text-sm text-muted-foreground mb-2">Please provide these to complete the seller profile:</div>
+                            <div className="flex flex-wrap gap-2">
+                              {message.data.missingFields.map((f, idx) => (
+                                <Badge key={idx} variant="outline" className="capitalize">{String(f).replace(/^seller_/,'').replace(/_/g,' ')}</Badge>
+                              ))}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      )}
+
                       {/* Transactions Status */}
                       {message.data.transactions && message.data.transactions.length > 0 && (
                         <Card className="bg-background">

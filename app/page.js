@@ -430,7 +430,7 @@ export default function RealEstateCRM() {
               </div>
 
               {/* Search and Filters */}
-              <div className="flex flex-col sm:flex-row gap-4">
+              <div className="flex flex-col sm:flex-row gap-4 items-stretch sm:items-end">
                 <div className="flex-1">
                   <div className="relative">
                     <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -452,6 +452,12 @@ export default function RealEstateCRM() {
                     <SelectItem value="seller">Sellers</SelectItem>
                   </SelectContent>
                 </Select>
+                <div className="sm:ml-auto">
+                  <Button onClick={() => setIsAddDialogOpen(true)} className="w-full sm:w-auto">
+                    <Plus className="mr-2 h-4 w-4" />
+                    Add Lead
+                  </Button>
+                </div>
               </div>
 
               {/* Leads List */}
@@ -646,12 +652,9 @@ export default function RealEstateCRM() {
             </TabsContent>
           </Tabs>
         </div>
-      </div>
-
-      {/* All existing dialogs remain the same... */}
-      {/* Add Lead Dialog */}
+        </div>
       <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Add New Lead</DialogTitle>
             <DialogDescription>
@@ -1018,11 +1021,11 @@ export default function RealEstateCRM() {
       {/* Edit Lead Dialog */}
       {selectedLead && (
         <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
-          <DialogContent className="max-w-2xl">
+          <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>Edit Lead</DialogTitle>
               <DialogDescription>
-                Update lead information and preferences.
+                Update lead details and preferences.
               </DialogDescription>
             </DialogHeader>
             <div className="grid grid-cols-2 gap-4">
@@ -1369,11 +1372,11 @@ export default function RealEstateCRM() {
 
       {/* Start Transaction from Lead Dialog */}
       <Dialog open={isStartTransDialogOpen} onOpenChange={setIsStartTransDialogOpen}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Start Transaction</DialogTitle>
             <DialogDescription>
-              Prefilled from the selected lead. Adjust details and create the transaction.
+              Create a transaction pre-filled from this lead.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">

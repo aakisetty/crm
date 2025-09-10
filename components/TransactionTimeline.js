@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -31,7 +32,9 @@ import {
   Check,
   X,
   ChevronRight,
-  ChevronDown
+  ChevronDown,
+  Mic,
+  Square
 } from 'lucide-react'
 
 // Stage configurations for seller (sale) and buyer (purchase) transactions
@@ -135,6 +138,20 @@ export function TransactionTimeline({ transactionId }) {
     weight: 1,
     parent_id: null
   })
+
+  // Voice memo recording state
+  const [rec, setRec] = useState({
+    active: false,
+    itemId: null,
+    mediaRecorder: null,
+    chunks: [],
+    stream: null,
+    elapsed: 0,
+    timer: null,
+    mimeType: 'audio/webm'
+  })
+  const [memoNotes, setMemoNotes] = useState({}) // per-item note text
+  const recRef = useRef({})
 
   useEffect(() => {
     if (transactionId) {
@@ -363,6 +380,125 @@ export function TransactionTimeline({ transactionId }) {
     return new Date(date).toLocaleDateString()
   }
 
+  const startRecording = async (itemId) => {
+    try {
+      if (rec.active) return
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Microphone not available in this browser')
+        return
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      let mimeType = 'audio/webm;codecs=opus'
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus'
+      } else if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+        mimeType = 'audio/ogg;codecs=opus'
+      } else if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'
+      } else {
+        // fallback minimal
+        mimeType = ''
+      }
+
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      const chunks = []
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data)
+      }
+      mr.onstop = async () => {
+        try {
+          const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' })
+          const note = memoNotes[itemId] || ''
+          const durationSec = recRef.current.elapsed || 0
+          const form = new FormData()
+          form.append('audio', blob, 'memo.webm')
+          if (note) form.append('note', note)
+          form.append('duration', String(Math.round(durationSec)))
+          const res = await fetch(`/api/checklist/${itemId}/voice`, { method: 'POST', body: form })
+          const data = await res.json().catch(() => ({}))
+          if (!res.ok || data?.success === false) {
+            console.error('Upload failed', data)
+            alert(data?.error || 'Failed to upload voice memo')
+          } else {
+            // Replace item in checklist with updated one from server if provided
+            if (data.checklist_item) {
+              setChecklistItems((items) => items.map((it) => it.id === itemId ? data.checklist_item : it))
+            } else {
+              // fallback refresh
+              fetchChecklist()
+            }
+            // clear note for that item
+            setMemoNotes((m) => ({ ...m, [itemId]: '' }))
+          }
+        } catch (err) {
+          console.error('Error finalizing voice memo upload', err)
+          alert('Error uploading voice memo')
+        } finally {
+          // cleanup
+          try { stream.getTracks().forEach(t => t.stop()) } catch {}
+          if (rec.timer) clearInterval(rec.timer)
+          setRec({ active: false, itemId: null, mediaRecorder: null, chunks: [], stream: null, elapsed: 0, timer: null, mimeType: 'audio/webm' })
+          recRef.current = { elapsed: 0 }
+        }
+      }
+
+      // begin recording
+      mr.start()
+      const timer = setInterval(() => {
+        recRef.current.elapsed = (recRef.current.elapsed || 0) + 0.2
+        setRec((r) => ({ ...r, elapsed: (recRef.current.elapsed || 0) }))
+      }, 200)
+      recRef.current.elapsed = 0
+      setRec({ active: true, itemId, mediaRecorder: mr, chunks, stream, elapsed: 0, timer, mimeType: mr.mimeType || 'audio/webm' })
+    } catch (e) {
+      console.error('startRecording error', e)
+      alert('Failed to start recording')
+    }
+  }
+
+  const stopRecording = async () => {
+    try {
+      if (!rec.active || !rec.mediaRecorder) return
+      rec.mediaRecorder.stop()
+    } catch (e) {
+      console.warn('stopRecording error', e)
+    }
+  }
+
+  const cancelRecording = () => {
+    try {
+      if (rec.stream) {
+        try { rec.stream.getTracks().forEach(t => t.stop()) } catch {}
+      }
+      if (rec.timer) clearInterval(rec.timer)
+    } finally {
+      setRec({ active: false, itemId: null, mediaRecorder: null, chunks: [], stream: null, elapsed: 0, timer: null, mimeType: 'audio/webm' })
+      recRef.current = { elapsed: 0 }
+    }
+  }
+
+  const deleteVoiceMemo = async (itemId, memoId) => {
+    try {
+      const ok = confirm('Delete this voice memo?')
+      if (!ok) return
+      const res = await fetch(`/api/checklist/${itemId}/voice/${memoId}`, { method: 'DELETE' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data?.success === false) {
+        console.error('Failed to delete memo', data)
+        alert(data?.error || 'Failed to delete voice memo')
+        return
+      }
+      setChecklistItems((items) => items.map((it) => {
+        if (it.id !== itemId) return it
+        const memos = Array.isArray(it.voice_memos) ? it.voice_memos.filter(m => m.id !== memoId) : []
+        return { ...it, voice_memos: memos }
+      }))
+    } catch (e) {
+      console.error('deleteVoiceMemo error', e)
+    }
+  }
+
   const TaskItem = ({ item, indent = 0, isChild = false }) => {
     const StatusIcon = STATUS_CONFIG[item.status]?.icon || Circle
     
@@ -414,6 +550,60 @@ export function TransactionTimeline({ transactionId }) {
                     <div className="flex items-center gap-1">
                       <FileText className="h-3 w-3" />
                       Notes
+                    </div>
+                  )}
+                </div>
+
+                {/* Voice Memos */}
+                <div className={`mt-3 space-y-2 ${isChild ? 'text-xs' : 'text-sm'}`}>
+                  {/* Controls */}
+                  {rec.active && rec.itemId === item.id ? (
+                    <div className="flex items-center gap-2">
+                      <div className="px-2 py-1 bg-red-50 text-red-700 rounded border border-red-200">
+                        Recording... {Math.round(rec.elapsed)}s
+                      </div>
+                      <Button size="sm" variant="destructive" onClick={stopRecording}>
+                        <Square className="h-4 w-4 mr-1" /> Stop
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={cancelRecording}>
+                        <X className="h-4 w-4 mr-1" /> Cancel
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Input
+                        className={`h-8 ${isChild ? 'text-xs' : 'text-sm'}`}
+                        placeholder="Memo note (optional)"
+                        value={memoNotes[item.id] || ''}
+                        onChange={(e) => setMemoNotes((m) => ({ ...m, [item.id]: e.target.value }))}
+                        style={{ maxWidth: 240 }}
+                      />
+                      <Button size="sm" onClick={() => startRecording(item.id)}>
+                        <Mic className="h-4 w-4 mr-1" /> Record
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* List of memos (transcriptions) */}
+                  {Array.isArray(item.voice_memos) && item.voice_memos.length > 0 && (
+                    <div className="space-y-2">
+                      {item.voice_memos.map((m) => (
+                        <div key={m.id} className="flex items-start justify-between bg-muted/40 p-2 rounded">
+                          <div className="flex-1 pr-2">
+                            <div className="text-foreground break-words"><strong>Transcript:</strong> {m.text || '(empty)'}
+                            </div>
+                            <div className="text-muted-foreground text-xs mt-1 flex items-center gap-2">
+                              {m.note && <span>Note: {m.note}</span>}
+                              {m.duration_sec != null && (
+                                <span>• {Math.round(m.duration_sec)}s</span>
+                              )}
+                            </div>
+                          </div>
+                          <Button size="icon" variant="ghost" onClick={() => deleteVoiceMemo(item.id, m.id)}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>

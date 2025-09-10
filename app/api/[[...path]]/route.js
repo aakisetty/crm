@@ -1,6 +1,8 @@
 import { MongoClient } from 'mongodb'
 import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
+import fs from 'fs'
+import nodePath from 'path'
 
 // MongoDB connection
 let client
@@ -2480,6 +2482,7 @@ async function handleRoute(request, { params }) {
         preferences: body.preferences || {},
         assigned_agent: body.assigned_agent || null,
         tags: body.tags || [],
+        source: body.source || 'manual',
         status: 'new',
         created_at: new Date(),
         updated_at: new Date()
@@ -2999,7 +3002,7 @@ async function handleRoute(request, { params }) {
     if (route === '/assistant/match' && method === 'POST') {
       try {
         const body = await request.json()
-        let { parsed_data, original_message, agent_name } = body
+        let { parsed_data, original_message, agent_name, lead_id: incomingLeadId } = body
 
         // Allow flexible inputs from frontend: query/text/message/original_message
         let query = (body.query || body.text || body.message || original_message || '').toString()
@@ -3037,290 +3040,170 @@ async function handleRoute(request, { params }) {
           }))
         }
 
-        const { lead_info = {}, preferences = {}, intent = '', summary = '', transaction_info = {} } = parsed_data || {}
+        // Extract entities and enhance for seller detection
+        let { lead_info = {}, preferences = {}, intent = '', summary = '', transaction_info = {} } = parsed_data || {}
 
-        // Only handle lead/property workflows here. For other intents (e.g., transactions status),
-        // fall through so the later intent-based handler can process the request.
-        const normalizedIntentLead = (parsed_data?.intent || '').toString().toLowerCase()
-        const leadIntents = new Set(['find_properties', 'create_lead', 'update_preferences', 'create_transaction'])
-        if (!parsed_data || (normalizedIntentLead && !leadIntents.has(normalizedIntentLead))) {
-          // Not a lead/property flow. Handle common intents here to avoid re-reading the request body.
-          // Normalize common fields
-          const agent = body.agent || body.agent_name
-          const limit = typeof body.limit === 'number' ? body.limit : 5
+        const wholeMessage = (original_message || query || '').toString()
+        const lcWhole = wholeMessage.toLowerCase()
+        const sellerHints = (
+          /\bseller\b/.test(lcWhole) ||
+          /\bsell(?:ing)?\b/.test(lcWhole) ||
+          /\blist(?:ing)?\b/.test(lcWhole) ||
+          /\basking\s+price\b/.test(lcWhole) ||
+          /\bmy\s+(?:house|home|condo|apartment)\b/.test(lcWhole)
+        )
+        const explicitSellerFields = Boolean(
+          (preferences && (preferences.seller_address || preferences.seller_price)) ||
+          (transaction_info && (transaction_info.listing_price || transaction_info.property_address))
+        )
+        if (!lead_info.lead_type && (sellerHints || explicitSellerFields)) {
+          lead_info.lead_type = 'seller'
+        }
 
-          // Get lightweight intent/entities if absent
-          let intentLight = (body.intent || '').toString()
-          let entities = body.entities || {}
-
-          // Heuristic pre-detection for common phrasing like "status of priya sharma"
-          if (!intentLight && (query || '').trim()) {
-            const lc = query.toLowerCase()
-            if (lc.includes('status') && (lc.includes('transaction') || lc.includes('deal') || lc.includes('status of'))) {
-              intentLight = 'transactions.status'
-              // Extract name after "status of"
-              const m = lc.match(/status\s+of\s+([a-z]+(?:\s+[a-z]+){0,2})/i)
-              if (m && !entities.client_name) entities.client_name = m[1]
-            }
-            // New: seller overview quick heuristic
-            else if ((lc.includes('seller') || lc.includes('listing') || lc.includes('lead')) && lc.includes('overview')) {
-              intentLight = 'leads.overview'
-              // Extract name after "overview of" and strip trailing politeness
-              const m2 = lc.match(/overview\s+of\s+([a-z]+(?:\s+[a-z]+){0,2})(?:\s+(?:please|thanks|thank\s+you))?/i)
-              if (m2 && !entities.client_name) {
-                const cleaned = (m2[1] || '').replace(/\b(please|thanks|thank\s+you)\b/gi, ' ').replace(/[^a-z\s]/gi, ' ').replace(/\s+/g, ' ').trim()
-                if (cleaned) entities.client_name = cleaned
-              }
-            }
-          }
-
-          if (!intentLight && (query || '').trim()) {
-            try {
-              const parseRes = await handleRoute(
-                new Request(request.url, {
-                  method: 'POST',
-                  body: JSON.stringify({ text: query }),
-                  headers: { 'content-type': 'application/json' }
-                }),
-                { params: { path: ['assistant','parse'] } }
-              )
-              const j = await parseRes.json()
-              intentLight = j.intent || intentLight
-              entities = j.entities || entities
-            } catch (_) { /* ignore */ }
-          }
-
-          // Improve name detection for lowercase inputs like "priya sharma's"
-          if (!entities.client_name && (query || '').trim()) {
-            const poss = query.match(/([a-z]+(?:\s+[a-z]+){1,2})['’`´]s/i)
-            if (poss) {
-              entities.client_name = poss[1].trim()
-            }
-          }
-
-          // If still no client_name, try candidate 2-3 word sequences and verify against leads
-          if (!entities.client_name && (query || '').trim()) {
-            const words = (query.toLowerCase().match(/[a-z]+/g) || [])
-            const candidates = new Set()
-            for (let i = 0; i < words.length - 1; i++) {
-              const two = `${words[i]} ${words[i+1]}`
-              candidates.add(two)
-              if (i < words.length - 2) {
-                candidates.add(`${two} ${words[i+2]}`)
-              }
-            }
-            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            for (const cand of candidates) {
-              try {
-                const lead = await db.collection('leads').findOne({ name: new RegExp(`^${esc(cand)}$`, 'i') })
-                if (lead) { entities.client_name = lead.name; break }
-              } catch (_) { /* ignore */ }
-            }
-          }
-
-          const now = new Date()
-          const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
-          const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
-          const agentFilterTx = agent ? { assigned_agent: agent } : {}
-          const agentFilterTasks = agent ? { assignee: agent } : {}
-          const stripId = (doc) => { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
-          const makeAnswer = (title, bullets) => `${title}\n- ${bullets.filter(Boolean).join('\n- ')}`
-
-          // New: Seller lead overview intent
-          if (intentLight === 'leads.overview') {
-            // Resolve lead by name, prioritizing sellers
-            const nameRaw = entities.client_name || ''
-            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            let lead = null
-            try {
-              if (nameRaw) {
-                const nameRx = new RegExp(esc(nameRaw), 'i')
-                const candidates = await db.collection('leads')
-                  .find({ name: nameRx })
-                  .sort({ updated_at: -1 })
-                  .limit(5)
-                  .toArray()
-                if (candidates && candidates.length) {
-                  lead = candidates.find(l => String(l.lead_type || '').toLowerCase() === 'seller') || candidates[0]
-                }
-              } else {
-                // Fallback to most recent seller
-                lead = await db.collection('leads').find({ lead_type: 'seller' }).sort({ updated_at: -1 }).limit(1).next()
-              }
-            } catch (_) { /* ignore lookup errors */ }
-
-            if (!lead) {
-              const who = nameRaw ? ` for ${nameRaw}` : ''
-              const answer = makeAnswer(`I couldn't find a matching seller lead${who}.`, [
-                'Try using the exact client name as saved in CRM',
-                'Or provide an email/phone so I can locate the lead'
-              ])
-              return handleCORS(NextResponse.json({ success: true, intent: 'leads.overview', answer }))
+        function findLikelyPrice(text) {
+          try {
+            const t = String(text || '')
+            const l = t.toLowerCase()
+            const toNumber = (numStr, unit) => {
+              let n = parseFloat(String(numStr).replace(/,/g, ''))
+              const u = (unit || '').toLowerCase()
+              if (u === 'm' || u === 'million') n *= 1_000_000
+              else if (u === 'k' || u === 'thousand') n *= 1_000
+              if (!isFinite(n)) return null
+              return Math.round(n)
             }
 
-            const prefs = lead.preferences || {}
-            const sellerAddress = prefs.seller_address || prefs.address
-            const sellerPrice = prefs.seller_price ?? prefs.asking_price
-            const bullets = [
-              `Name: ${lead.name}${lead.lead_type ? ` (${lead.lead_type})` : ''}`,
-              `Contact: ${lead.email || '—'} | ${lead.phone || '—'}`,
-              sellerAddress ? `Address: ${sellerAddress}` : null,
-              sellerPrice != null ? `Asking price: $${Number(sellerPrice).toLocaleString()}` : null,
-              prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` • ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` • ${prefs.seller_bathrooms} ba` : ''}` : null,
-              prefs.seller_year_built ? `Year built: ${prefs.seller_year_built}` : null,
-              prefs.seller_square_feet ? `Size: ${prefs.seller_square_feet} sqft` : null,
-              prefs.seller_lot_size ? `Lot: ${prefs.seller_lot_size}` : null,
-              prefs.seller_condition ? `Condition: ${prefs.seller_condition}` : null,
-              prefs.seller_occupancy ? `Occupancy: ${prefs.seller_occupancy}` : null,
-              prefs.seller_timeline ? `Timeline to list: ${prefs.seller_timeline}` : null,
-              prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : '—'}` : null,
-              prefs.seller_description ? `Notes: ${prefs.seller_description}` : null,
-              lead.updated_at ? `Last updated: ${new Date(lead.updated_at).toLocaleString()}` : null
-            ]
-            const overview = makeAnswer(`Seller lead overview for ${lead.name}:`, bullets)
+            // 1) Strong signal: keywords near amount
+            const kwRe = /(asking|ask|list(?:ing)?|price|offer|for)\s*[:\-]?\s*\$?\s*([0-9][\d,\.]*)\s*(m|million|k|thousand)?/i
+            const kw = l.match(kwRe)
+            if (kw) return toNumber(kw[2], kw[3])
 
-            // Dynamic next steps suggestions
-            const actions = []
-            const soonish = (prefs.seller_timeline || '').toString().toLowerCase().includes('week') || (prefs.seller_timeline || '').toString().toLowerCase().includes('soon')
-            actions.push('Schedule a listing consultation and walkthrough')
-            actions.push('Prepare CMA with 3–5 comps and pricing strategy')
-            if (prefs.seller_condition && /needs|repair|fix|update/i.test(prefs.seller_condition)) actions.push('Outline repair/refresh plan (paint, fixtures, minor repairs)')
-            else actions.push('Create a light staging/declutter checklist')
-            actions.push('Book professional photography and floor plan')
-            actions.push('Gather docs: HOA, disclosures, utility averages, survey')
-            actions.push('Draft listing timeline and MLS remarks')
-            if (soonish) actions.push('Expedite prep: compress timeline to 1–2 weeks with daily checkpoints')
-            const nextSteps = makeAnswer('Suggested next steps:', actions)
-
-            // Optional AI insights reuse
-            let insights = ''
-            try {
-              if (String(lead.lead_type || '').toLowerCase() === 'seller') {
-                insights = await generateLeadInsights(lead, [])
-              }
-            } catch (_) { /* non-fatal */ }
-
-            const answer = `${overview}\n\n${nextSteps}${insights ? `\n\nAI Insights:\n\n${insights}` : ''}`
-            return handleCORS(NextResponse.json({ success: true, intent: 'leads.overview', answer, lead: stripId(lead), ai_recommendations: insights }))
-          }
-
-          if (intentLight === 'transactions.status') {
-            const txQuery = { ...agentFilterTx, current_stage: { $ne: 'closed' } }
-            if (entities?.transaction_id) txQuery.id = entities.transaction_id
-            if (entities?.address) {
-              const rx = new RegExp(entities.address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
-              txQuery.$or = [
-                { address: rx },
-                { property_address: rx },
-                { 'property.address': rx },
-                { 'property.full_address': rx },
-                { title: rx }
-              ]
+            // 2) Dollar amounts anywhere
+            const dollarRe = /\$\s*([0-9][\d,\.]*)\s*(m|million|k|thousand)?/ig
+            let m2, best2 = 0
+            while ((m2 = dollarRe.exec(l))) {
+              const val = toNumber(m2[1], m2[2])
+              if (val && val > best2) best2 = val
             }
-            if (entities?.client_name) {
-              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-              const nameRx = new RegExp(esc(entities.client_name), 'i')
-              txQuery.$or = [ ...(txQuery.$or || []), { client_name: nameRx } ]
-              try {
-                const leads = await db.collection('leads').find({ name: nameRx }).project({ id: 1 }).toArray()
-                const leadIds = leads.map(l => l.id).filter(Boolean)
-                if (leadIds.length) {
-                  txQuery.$or.push({ lead_id: { $in: leadIds } })
-                }
-              } catch (_) { /* ignore */ }
-            }
-            const txs = await db.collection('transactions')
-              .find(txQuery)
-              .sort({ updated_at: -1 })
-              .limit(limit)
-              .toArray()
-            const enriched = []
-            for (const tx of txs) {
-              const nextTasks = await db.collection('checklist_items')
-                .find({ transaction_id: tx.id, status: { $ne: 'completed' } })
-                .sort({ due_date: 1 })
-                .limit(3)
-                .toArray()
-              enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
-            }
-            const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
-            const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
-            const payload = { success: true, intent: 'transactions.status', answer, transactions: enriched }
-            if (body.debug) payload.debug = { intentLight, entities, matched: enriched.length }
-            return handleCORS(NextResponse.json(payload))
-          }
+            if (best2 >= 1000) return best2
 
-          // If user asked for a status but intent wasn't resolved, still try transactions search
-          const lcq = (query || '').toLowerCase()
-          if (!intentLight && lcq.includes('status') && (lcq.includes('transaction') || lcq.includes('deal') || lcq.includes('status of'))) {
-            // Ensure we have a client_name if possible
-            if (!entities.client_name) {
-              const poss = (query || '').match(/([a-z]+(?:\s+[a-z]+){1,2})['’`´]s/i)
-              if (poss) entities.client_name = poss[1].trim()
+            // 3) Number + unit like 500k, 1.2m
+            const unitRe = /\b([0-9][\d,\.]*)\s*(m|million|k|thousand)\b/ig
+            let m3, best3 = 0
+            while ((m3 = unitRe.exec(l))) {
+              const val = toNumber(m3[1], m3[2])
+              if (val && val > best3) best3 = val
             }
-            if (!entities.client_name) {
-              const words = (lcq.match(/[a-z]+/g) || [])
-              const candidates = new Set()
-              for (let i = 0; i < words.length - 1; i++) {
-                const two = `${words[i]} ${words[i+1]}`
-                candidates.add(two)
-                if (i < words.length - 2) candidates.add(`${two} ${words[i+2]}`)
-              }
-              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-              for (const cand of candidates) {
-                try {
-                  const lead = await db.collection('leads').findOne({ name: new RegExp(`^${esc(cand)}$`, 'i') })
-                  if (lead) { entities.client_name = lead.name; break }
-                } catch (_) { /* ignore */ }
+            if (best3 >= 1000) return best3
+
+            // 4) Fallback: choose a large standalone number not tied to beds/baths/sqft/year/lot/hoa
+            const numRe = /\b([0-9][\d,\.]*)\b/g
+            let m4, best4 = 0
+            while ((m4 = numRe.exec(l))) {
+              const start = m4.index
+              const end = start + m4[0].length
+              const ctx = l.slice(Math.max(0, start - 10), Math.min(l.length, end + 10))
+              if (/(bed|br|bath|ba|sq\s?ft|sqft|square\s?feet|year|built|lot|hoa)/.test(ctx)) continue
+              const val = toNumber(m4[1], null)
+              if (val && val > best4) best4 = val
+            }
+            if (best4 >= 10000) return best4
+            return null
+          } catch { return null }
+        }
+
+        function extractSellerDetailsFromText(text) {
+          const out = {}
+          try {
+            const t = String(text || '')
+            const l = t.toLowerCase()
+            // property type
+            if (/\b(single[-\s]?family)\b/.test(l)) out.seller_property_type = 'single_family'
+            else if (/\bcondo\b/.test(l)) out.seller_property_type = 'condo'
+            else if (/\btown\s?house\b/.test(l)) out.seller_property_type = 'townhouse'
+            else if (/\bmulti[-\s]?family\b/.test(l)) out.seller_property_type = 'multi_family'
+            else if (/\bland\b/.test(l)) out.seller_property_type = 'land'
+
+            // bedrooms / bathrooms
+            const bed = l.match(/(\d+(?:\.5)?)\s*(?:bed(?:rooms?)?|br)\b/)
+            if (bed) out.seller_bedrooms = Number(bed[1])
+            const bath = l.match(/(\d+(?:\.5)?)\s*(?:bath(?:rooms?)?|ba)\b/)
+            if (bath) out.seller_bathrooms = Number(bath[1])
+
+            // year built
+            const year = l.match(/\b(?:built|year)\D{0,6}(19\d{2}|20\d{2})\b/)
+            if (year) out.seller_year_built = Number(year[1])
+
+            // square feet
+            const sqft = l.match(/(\d{3,5})\s*(?:sq\s?ft|sqft|square\s?feet)\b/)
+            if (sqft) out.seller_square_feet = Number(sqft[1].replace(/,/g, ''))
+
+            // lot size (sq ft or acres) with various phrasings
+            // e.g., "lot size is 2400 sqft", "lot 0.25 acres", "lot size: 6,500"
+            const lot1 = l.match(/\blot\s*size\s*(?:is|of|:|=)?\s*~?\s*([\d,\.]+)\s*(sq\s?ft|sqft|square\s?feet|acres?|ac)?\b/)
+            const lot2 = l.match(/\blot\s*(?:is|size)?\s*~?\s*([\d,\.]+)\s*(sq\s?ft|sqft|square\s?feet|acres?|ac)\b/)
+            const lot3 = l.match(/\b([\d,\.]+)\s*(sq\s?ft|sqft)\b[^\n]{0,15}\blot\b/)
+            const lot = lot1 || lot2 || lot3
+            if (lot) {
+              const num = parseFloat(lot[1].replace(/,/g, ''))
+              const unit = (lot[2] || 'sqft').toLowerCase()
+              if (isFinite(num)) {
+                out.seller_lot_size = unit.startsWith('ac') ? Math.round(num * 43560) : Math.round(num)
               }
             }
 
-            const txQuery = { ...agentFilterTx, current_stage: { $ne: 'closed' } }
-            if (entities?.client_name) {
-              const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-              const nameRx = new RegExp(esc(entities.client_name), 'i')
-              txQuery.$or = [ ...(txQuery.$or || []), { client_name: nameRx } ]
-              try {
-                const leads = await db.collection('leads').find({ name: nameRx }).project({ id: 1 }).toArray()
-                const leadIds = leads.map(l => l.id).filter(Boolean)
-                if (leadIds.length) txQuery.$or.push({ lead_id: { $in: leadIds } })
-              } catch (_) { /* ignore */ }
+            // occupancy
+            if (/owner[-\s]?occupied/.test(l) || /owner\b/.test(l)) out.seller_occupancy = 'owner'
+            else if (/tenant\b/.test(l)) out.seller_occupancy = 'tenant'
+            else if (/vacant\b/.test(l)) out.seller_occupancy = 'vacant'
+
+            // condition
+            if (/needs?\s+work/.test(l)) out.seller_condition = 'needs_work'
+            else if (/\baverage\b/.test(l)) out.seller_condition = 'average'
+            else if (/\bgood\b/.test(l)) out.seller_condition = 'good'
+            else if (/\bexcellent\b/.test(l)) out.seller_condition = 'excellent'
+
+            // timeline
+            if (/\basap\b|\bimmediately\b|\bright away\b/.test(l)) out.seller_timeline = 'asap'
+            else if (/(30|thirty)\s*[–-]?\s*(60|sixty)\s*days/.test(l)) out.seller_timeline = '30_60'
+            else if (/(60|sixty)\s*[–-]?\s*(90|ninety)\s*days/.test(l)) out.seller_timeline = '60_90'
+            else if (/(90|ninety)\+?\s*days/.test(l)) out.seller_timeline = '90_plus'
+
+            // HOA
+            const hoa = l.match(/\bhoa\b[^0-9$]{0,10}(?:fee|dues)?[^0-9$]{0,10}\$?\s*([\d,][\d,\.]*)/)
+            if (hoa) {
+              const n = parseFloat(String(hoa[1]).replace(/,/g, ''))
+              if (isFinite(n)) out.seller_hoa_fee = Math.round(n)
             }
-            const txs = await db.collection('transactions')
-              .find(txQuery)
-              .sort({ updated_at: -1 })
-              .limit(limit)
-              .toArray()
-            const enriched = []
-            for (const tx of txs) {
-              const nextTasks = await db.collection('checklist_items')
-                .find({ transaction_id: tx.id, status: { $ne: 'completed' } })
-                .sort({ due_date: 1 })
-                .limit(3)
-                .toArray()
-              enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
-            }
-            const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
-            const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
-            return handleCORS(NextResponse.json({ success: true, intent: 'transactions.status', answer, transactions: enriched }))
+
+            // Asking price (avoid picking up bed/bath counts)
+            const price = findLikelyPrice(t)
+            if (price) out.seller_price = price
+
+          } catch { /* ignore */ }
+          return out
+        }
+
+        if ((lead_info.lead_type || '').toLowerCase() === 'seller') {
+          preferences = preferences || {}
+          if (!preferences.seller_address && transaction_info?.property_address) {
+            preferences.seller_address = transaction_info.property_address
           }
+          if (preferences.seller_price == null) {
+            const priceNum = typeof transaction_info?.listing_price === 'number' ? transaction_info.listing_price
+              : (typeof transaction_info?.price === 'number' ? transaction_info.price : findLikelyPrice(wholeMessage))
+            if (typeof priceNum === 'number' && isFinite(priceNum)) preferences.seller_price = priceNum
+          }
+        }
 
-          // Fallback quick snapshot
-          const recentLeads = await db.collection('leads').find(agent ? { assigned_agent: agent } : {}).sort({ created_at: -1 }).limit(5).toArray()
-          const overdueCount = await db.collection('checklist_items').countDocuments({ status: { $ne: 'completed' }, due_date: { $lt: now }, ...(agent ? { assignee: agent } : {}) })
-          const alertsResult = await getSmartAlerts(db, agent ? { agent } : {})
-          const bullets = [
-            `${recentLeads.length} recent leads`,
-            `${overdueCount} overdue tasks`,
-            `${(alertsResult?.total ?? (alertsResult?.alerts?.length ?? 0))} smart alerts`
-          ]
-          const answer = makeAnswer('Here is a quick snapshot:', bullets)
-          return handleCORS(NextResponse.json({ success: true, intent: 'general.suggestions', answer, recent_leads: recentLeads.map(stripId), overdue_tasks: overdueCount, smart_alerts: (alertsResult?.alerts || []).map(stripId) }))
-        } else {
-
-        // Step 1: Find or create lead
+        // Step 1: Find or create lead (pre-lookup)
         let lead = null
         let isNewLead = false
+
+        // If the frontend sent a specific lead_id, prefer it
+        if (incomingLeadId) {
+          try { lead = await db.collection('leads').findOne({ id: String(incomingLeadId) }) } catch (_) {}
+        }
 
         const leadQuery = []
         if (lead_info.email) leadQuery.push({ email: lead_info.email })
@@ -3332,25 +3215,28 @@ async function handleRoute(request, { params }) {
           lead = await db.collection('leads').findOne({ name: { $regex: new RegExp(`^${lead_info.name}$`, 'i') } })
         }
 
-        if (!lead && (lead_info.name || lead_info.email || lead_info.phone)) {
+        if (!lead && ((lead_info.name || lead_info.email || lead_info.phone) || (sellerHints || explicitSellerFields))) {
+          const defaultName = lead_info.name || ((sellerHints || explicitSellerFields) ? 'Unknown Seller' : 'Unknown')
           const newLead = {
             id: uuidv4(),
-            name: lead_info.name || 'Unknown',
+            name: defaultName,
             email: lead_info.email || null,
             phone: lead_info.phone || null,
-            lead_type: lead_info.lead_type || 'buyer',
+            lead_type: (lead_info.lead_type || (sellerHints || explicitSellerFields ? 'seller' : 'buyer')).toLowerCase(),
             preferences: preferences || {},
             assigned_agent: agent_name || null,
+            source: 'assistant',
             tags: [],
             status: 'new',
             created_at: new Date(),
             updated_at: new Date()
           }
+
           await db.collection('leads').insertOne(newLead)
           lead = newLead
           isNewLead = true
         } else if (lead) {
-          // Only merge preferences if payload contains real values; otherwise keep existing prefs intact
+          // ...
           const cleanPrefs = sanitizePreferences(preferences)
           if (Object.keys(cleanPrefs).length) {
             await db.collection('leads').updateOne(
@@ -3378,6 +3264,38 @@ async function handleRoute(request, { params }) {
             const priceNum = typeof transaction_info.listing_price === 'number' ? transaction_info.listing_price
               : (typeof transaction_info.price === 'number' ? transaction_info.price : undefined)
             if (typeof priceNum === 'number') prefsUpdate.seller_price = priceNum
+          }
+          // Extract more seller fields from message text if missing
+          const extracted = extractSellerDetailsFromText(wholeMessage)
+          for (const [k, v] of Object.entries(extracted)) {
+            if (v === undefined) continue
+            const curr = effectivePrefs[k]
+            const isMissing = (curr === undefined || curr === null || (typeof curr === 'string' && curr.trim() === ''))
+            if (isMissing) {
+              prefsUpdate[k] = v
+              continue
+            }
+            // Corrections for clearly wrong values
+            if (k === 'seller_price') {
+              const currNum = Number(curr)
+              const newNum = Number(v)
+              if (Number.isFinite(newNum) && (Number.isNaN(currNum) || currNum < 1000)) {
+                prefsUpdate[k] = newNum
+              }
+            } else if (k === 'seller_lot_size') {
+              const currNum = Number(curr)
+              const newNum = Number(v)
+              // treat < 200 sqft as unrealistic/placeholder
+              if (Number.isFinite(newNum) && (Number.isNaN(currNum) || currNum < 200)) {
+                prefsUpdate[k] = newNum
+              }
+            } else if (k === 'seller_hoa_fee') {
+              const currNum = Number(curr)
+              const newNum = Number(v)
+              if (Number.isFinite(newNum) && (Number.isNaN(currNum) || currNum <= 0 || currNum !== newNum)) {
+                prefsUpdate[k] = newNum
+              }
+            }
           }
           if (Object.keys(prefsUpdate).length) {
             await db.collection('leads').updateOne(
@@ -3462,6 +3380,32 @@ async function handleRoute(request, { params }) {
           aiRecommendations = 'Your request has been processed.'
         }
 
+        // Step 4b: Missing field detection for seller slot-filling
+        let assistantAnswer = ''
+        let missingFields = []
+        if (leadType === 'seller') {
+          const p = lead?.preferences || {}
+          const requiredFirst = ['seller_address', 'seller_price']
+          const secondary = ['seller_property_type', 'seller_bedrooms', 'seller_bathrooms']
+          const optional = ['seller_year_built', 'seller_square_feet', 'seller_lot_size', 'seller_condition', 'seller_occupancy', 'seller_timeline', 'seller_hoa_fee']
+          const all = [...requiredFirst, ...secondary, ...optional]
+          for (const key of all) {
+            const val = p[key]
+            if (val === undefined || val === null || (typeof val === 'string' && val.trim() === '')) missingFields.push(key)
+          }
+          // Ask for up to 3 fields at a time, prioritize required + secondary
+          const priorities = [...requiredFirst, ...secondary, ...optional]
+          missingFields.sort((a, b) => priorities.indexOf(a) - priorities.indexOf(b))
+          const askNow = missingFields.slice(0, 3)
+          if (askNow.length > 0) {
+            const pretty = (k) => k
+              .replace(/^seller_/, '')
+              .replace(/_/g, ' ')
+              .replace(/\b\w/g, (c) => c.toUpperCase())
+            assistantAnswer = `I saved the details I have. Could you share the following missing info to complete the seller profile: ${askNow.map(pretty).join(', ')}?`
+          }
+        }
+
         // Persist AI insights on the lead for UI display
         try {
           if (lead?.id && aiRecommendations) {
@@ -3497,10 +3441,12 @@ async function handleRoute(request, { params }) {
           properties: properties.slice(0, 10),
           properties_count: properties.length,
           ai_recommendations: aiRecommendations,
+          answer: assistantAnswer || undefined,
+          require_more_details: Boolean(assistantAnswer),
+          missing_fields: assistantAnswer ? missingFields : [],
           conversation_id: conversationEntry.id,
           summary: summary
         }))
-        }
       } catch (error) {
         console.error('Assistant match error:', error)
         return handleCORS(NextResponse.json({
@@ -4083,7 +4029,6 @@ async function handleRoute(request, { params }) {
         }
 
         return handleCORS(NextResponse.json({
-          success: true,
           message: "Checklist item deleted successfully"
         }))
       } catch (error) {
@@ -4094,7 +4039,115 @@ async function handleRoute(request, { params }) {
         }, { status: 500 }))
       }
     }
-    
+
+    // POST /api/checklist/:id/voice - Upload a voice memo (multipart/form-data) and store transcription
+    if (route.match(/^\/checklist\/[^\/]+\/voice$/) && method === 'POST') {
+      try {
+        const itemId = path[1]
+        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        if (!existing) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Checklist item not found' }, { status: 404 }))
+        }
+
+        // Parse multipart form data
+        let form
+        try {
+          form = await request.formData()
+        } catch (_) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Expected multipart/form-data with an "audio" file' }, { status: 400 }))
+        }
+
+        const file = form.get('audio')
+        if (!file || typeof file.arrayBuffer !== 'function') {
+          return handleCORS(NextResponse.json({ success: false, error: 'Missing audio file in form field "audio"' }, { status: 400 }))
+        }
+        const note = (form.get('note') || '').toString()
+        const durationSec = Number(form.get('duration'))
+        const mime = (file.type || 'audio/webm').toString()
+
+        // Transcribe using OpenAI Whisper API
+        if (!process.env.OPENAI_API_KEY) {
+          return handleCORS(NextResponse.json({ success: false, error: 'OPENAI_API_KEY not configured for transcription' }, { status: 500 }))
+        }
+        const memoId = uuidv4()
+        const fileName = `${itemId}-${memoId}.webm`
+        const buffer = Buffer.from(await file.arrayBuffer())
+
+        let transcriptText = ''
+        try {
+          const fd = new FormData()
+          fd.append('model', 'whisper-1')
+          // Use a Blob so multipart/form-data boundary and filename are correct
+          const blob = new Blob([buffer], { type: mime || 'audio/webm' })
+          fd.append('file', blob, fileName)
+          // Optional: language hint if known; comment out if undesired
+          // fd.append('language', 'en')
+
+          const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            body: fd
+          })
+          if (!res.ok) {
+            const errTxt = await res.text().catch(() => '')
+            throw new Error(`Transcription failed: ${res.status} ${errTxt}`)
+          }
+          const json = await res.json()
+          transcriptText = (json.text || '').toString()
+        } catch (e) {
+          console.error('OpenAI transcription error', e)
+          return handleCORS(NextResponse.json({ success: false, error: 'Failed to transcribe audio' }, { status: 502 }))
+        }
+
+        const memo = {
+          id: memoId,
+          text: transcriptText,
+          note,
+          duration_sec: Number.isFinite(durationSec) ? durationSec : null,
+          created_at: new Date()
+        }
+
+        const existingMemos = Array.isArray(existing.voice_memos) ? existing.voice_memos : []
+        await db.collection('checklist_items').updateOne(
+          { id: itemId },
+          { $set: { voice_memos: [...existingMemos, memo], updated_at: new Date() } }
+        )
+
+        const updated = await db.collection('checklist_items').findOne({ id: itemId })
+        const { _id, ...cleaned } = updated
+        return handleCORS(NextResponse.json({ success: true, memo, checklist_item: cleaned }, { status: 201 }))
+      } catch (error) {
+        console.error('Error uploading voice memo:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to upload voice memo' }, { status: 500 }))
+      }
+    }
+
+    // DELETE /api/checklist/:id/voice/:memoId - Delete a transcribed memo
+    if (route.match(/^\/checklist\/[^\/]+\/voice\/[^\/]+$/) && method === 'DELETE') {
+      try {
+        const itemId = path[1]
+        const memoId = path[3]
+        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        if (!existing) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Checklist item not found' }, { status: 404 }))
+        }
+        const memos = Array.isArray(existing.voice_memos) ? existing.voice_memos : []
+        const memo = memos.find(m => m.id === memoId)
+        if (!memo) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Voice memo not found' }, { status: 404 }))
+        }
+        const filtered = memos.filter(m => m.id !== memoId)
+        await db.collection('checklist_items').updateOne(
+          { id: itemId },
+          { $set: { voice_memos: filtered, updated_at: new Date() } }
+        )
+        return handleCORS(NextResponse.json({ success: true }))
+      } catch (error) {
+        console.error('Error deleting voice memo:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to delete voice memo' }, { status: 500 }))
+      }
+    }
+
     // DEAL SUMMARY & SMART ALERTS ENDPOINTS
     
     // POST /api/agent/command - Process natural language agent commands
