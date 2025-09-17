@@ -1,8 +1,14 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import Link from 'next/link'
+
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { DropdownMenu as Menu, DropdownMenuTrigger as MenuTrigger, DropdownMenuContent as MenuContent, DropdownMenuItem as MenuItem } from '@/components/ui/dropdown-menu'
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -44,6 +50,57 @@ import { toast as showToast } from '@/hooks/use-toast'
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || ''
 const apiUrl = (path) => `${API_BASE}${path}`
 
+// Small inline form used in Popover to attach custom items with stage/due/priority
+function AttachForm({ item, txList = [], onSubmit }) {
+  const [txId, setTxId] = useState(txList[0]?.id || '')
+  const selectedTx = txList.find(t => t.id === txId) || txList[0] || null
+  const defaultStage = selectedTx?.stage || (selectedTx?.type === 'purchase' ? 'pre_approval' : 'pre_listing')
+  const [stage, setStage] = useState(defaultStage)
+  const [priority, setPriority] = useState('medium')
+  const [due, setDue] = useState('')
+
+  const sellerStages = ['pre_listing','listing','under_contract','escrow_closing']
+  const buyerStages = ['pre_approval','home_search','offer','under_contract','escrow_closing']
+  const stages = (selectedTx?.type === 'purchase') ? buyerStages : sellerStages
+
+  return (
+    <div className="space-y-2 text-sm">
+      <div>
+        <div className="text-xs text-muted-foreground mb-1">Transaction</div>
+        <select className="w-full border rounded px-2 py-1 bg-background" value={txId} onChange={(e) => { setTxId(e.target.value); const tx = txList.find(t => t.id === e.target.value); setStage(tx?.stage || (tx?.type === 'purchase' ? 'pre_approval' : 'pre_listing')) }}>
+          {txList.map(tx => (
+            <option key={tx.id} value={tx.id}>{tx.title}{tx.client ? ` • ${tx.client}` : ''}</option>
+          ))}
+        </select>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">Stage</div>
+          <select className="w-full border rounded px-2 py-1 bg-background" value={stage} onChange={(e) => setStage(e.target.value)}>
+            {stages.map(s => (<option key={s} value={s}>{s.replace(/_/g,' ')}</option>))}
+          </select>
+        </div>
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">Priority</div>
+          <select className="w-full border rounded px-2 py-1 bg-background" value={priority} onChange={(e) => setPriority(e.target.value)}>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="urgent">urgent</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <div className="text-xs text-muted-foreground mb-1">Due</div>
+        <input type="datetime-local" className="w-full border rounded px-2 py-1 bg-background" value={due} onChange={(e) => setDue(e.target.value)} />
+      </div>
+      <div className="flex justify-end gap-2 pt-1">
+        <Button size="sm" onClick={() => onSubmit && onSubmit(txId || selectedTx?.id, { stage, priority, due_date: due ? new Date(due).toISOString() : undefined })}>Attach</Button>
+      </div>
+    </div>
+  )
+}
+
 function formatDate(d) {
   if (!d) return '—'
   const date = new Date(d)
@@ -60,14 +117,22 @@ function formatTime(d) {
   } catch {
     return date.toLocaleTimeString()
   }
-}
 
+}
 function formatPlanWindow(meta) {
   if (!meta) return ''
-  const dateStr = new Date(meta.started_at).toLocaleDateString()
-  const start = formatTime(meta.started_at)
-  const end = formatTime(meta.ends_at)
-  return `${dateStr} ${start}–${end}`
+  const s = meta.started_at || meta.start || meta.date
+  const e = meta.ends_at || meta.end
+  const startDt = s ? new Date(s) : null
+  const endDt = e ? new Date(e) : null
+  if (!startDt || isNaN(startDt.getTime())) {
+    // Fallback to today's date without times
+    return new Date().toLocaleDateString()
+  }
+  const dateStr = startDt.toLocaleDateString()
+  const start = formatTime(startDt)
+  const end = endDt && !isNaN(endDt.getTime()) ? formatTime(endDt) : ''
+  return end ? `${dateStr} ${start}–${end}` : `${dateStr} ${start}`
 }
 
 function daysDiff(from, to = new Date()) {
@@ -91,6 +156,7 @@ function SectionHeader({ icon: Icon, title, count, right }) {
 }
 
 export function AssistantPanel() {
+  const router = useRouter()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [data, setData] = useState(null)
@@ -109,9 +175,16 @@ export function AssistantPanel() {
   const [planMeta, setPlanMeta] = useState(null) // { started_at, ends_at, ... }
   const [planContext, setPlanContext] = useState(null) // 'guided' | 'schedule' | null
   const [planView, setPlanView] = useState('list') // 'list' | 'grid'
+  const [inlinePlan, setInlinePlan] = useState(false) // replace NBA with plan grid when true
   const [guidedActive, setGuidedActive] = useState(false)
   const [guidedIndex, setGuidedIndex] = useState(0)
   const [lastSavedPlanId, setLastSavedPlanId] = useState(null)
+  // Inline Add Task (List view)
+  const [showNewTaskRow, setShowNewTaskRow] = useState(false)
+  const [newTaskTitle, setNewTaskTitle] = useState('')
+  const [newTaskDuration, setNewTaskDuration] = useState(30)
+  // Transactions for attaching custom tasks
+  const [txList, setTxList] = useState([])
   // NBA selection state
   const [nbaSelectedKeys, setNbaSelectedKeys] = useState(new Set())
   // Plan B state
@@ -261,6 +334,21 @@ export function AssistantPanel() {
 
   const onEditPlanTime = (item, startISO, endISO) => {
     setProposedPlan(prev => prev.map((it) => it.key === item.key ? { ...it, scheduled_start: startISO, scheduled_end: endISO } : it))
+    // Persist immediately if this is a real checklist task
+    if (item && item.id) {
+      ;(async () => {
+        try {
+          const res = await fetch(apiUrl(`/api/checklist/${item.id}`), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scheduled_start: startISO, scheduled_end: endISO, due_date: startISO })
+          })
+          if (!res.ok) throw new Error('Failed to save schedule')
+        } catch (e) {
+          try { showToast({ title: 'Save failed', description: e.message || 'Could not save schedule', variant: 'destructive' }) } catch {}
+        }
+      })()
+    }
   }
 
   // Add a custom ad-hoc task into the current plan (local; persisted with plan save)
@@ -281,6 +369,98 @@ export function AssistantPanel() {
     ])
   }
 
+  // Compute next available slot within plan window (or today) for a new task
+  const computeNextAvailableSlot = (durationMin = 30) => {
+    const dur = Math.max(1, Number(durationMin) || 30)
+    const now = new Date()
+    let windowStart = planMeta?.started_at ? new Date(planMeta.started_at) : new Date(now)
+    let windowEnd = planMeta?.ends_at ? new Date(planMeta.ends_at) : (() => { const d = new Date(now); d.setHours(now.getHours() + 8, 0, 0, 0); return d })()
+    // Start no earlier than now
+    if (windowStart < now) windowStart = new Date(now)
+    // Round start to next half-hour
+    const roundToHalfHour = (d) => { const r = new Date(d); const m = r.getMinutes(); const add = m === 0 ? 0 : (m <= 30 ? (30 - m) : (60 - m)); r.setMinutes(m + add, 0, 0); return r }
+    let candidate = roundToHalfHour(windowStart)
+    // Collect existing schedules
+    const intervals = (proposedPlan || [])
+      .filter(i => i.scheduled_start && i.scheduled_end)
+      .map(i => ({ s: new Date(i.scheduled_start), e: new Date(i.scheduled_end) }))
+      .filter(iv => iv.s < windowEnd && iv.e > windowStart)
+      .sort((a, b) => a.s - b.s)
+    const advance = (d) => new Date(d.getTime() + dur * 60000)
+    const overlaps = (s, e, iv) => !(e <= iv.s || s >= iv.e)
+    // scan
+    let idx = 0
+    while (candidate < windowEnd) {
+      const end = advance(candidate)
+      if (end > windowEnd) break
+      // Skip any intervals that end before candidate
+      while (idx < intervals.length && intervals[idx].e <= candidate) idx++
+      const iv = intervals[idx]
+      if (!iv || !overlaps(candidate, end, iv)) {
+        return { startISO: candidate.toISOString(), endISO: end.toISOString() }
+      }
+      // Move to end of overlapping interval and round again
+      candidate = roundToHalfHour(new Date(Math.max(candidate.getTime() + 5 * 60000, iv.e.getTime())))
+    }
+    // Fallback: no slot found; place at windowStart without schedule
+    return { startISO: null, endISO: null }
+  }
+
+  // Attach a plan item to a transaction as a real checklist task
+  const attachPlanItemToTransaction = async (item, txId, opts = {}) => {
+    try {
+      if (!txId) throw new Error('Select a transaction')
+      const payload = {
+        title: item.label || 'Task',
+        stage: opts.stage || undefined,
+        priority: opts.priority || undefined,
+        due_date: opts.due_date || undefined,
+      }
+      const createRes = await fetch(apiUrl(`/api/transactions/${txId}/checklist`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const created = await createRes.json().catch(() => ({}))
+      if (!createRes.ok || !created?.success) throw new Error(created?.error || 'Failed to create task')
+      const newId = created.checklist_item.id
+
+      // Determine schedule to persist
+      const est = Number(item.est_duration_min) || 30
+      const startISO = item.scheduled_start || (opts.due_date ? new Date(opts.due_date).toISOString() : null)
+      const endISO = item.scheduled_end || (startISO ? new Date(new Date(startISO).getTime() + est * 60000).toISOString() : null)
+
+      if (startISO || endISO || opts.due_date) {
+        await fetch(apiUrl(`/api/checklist/${newId}`), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scheduled_start: startISO,
+            scheduled_end: endISO,
+            due_date: (opts.due_date ? new Date(opts.due_date).toISOString() : (startISO || null))
+          })
+        }).catch(() => {})
+      }
+
+      // Update local plan item to reflect attachment
+      const tx = txList.find(t => t.id === txId)
+      setProposedPlan(prev => prev.map(it => it.key === item.key ? {
+        ...it,
+        id: newId,
+        transaction_id: txId,
+        source: 'checklist',
+        client_name: tx?.client || it.client_name,
+        property_address: tx?.title || it.property_address,
+        scheduled_start: startISO || it.scheduled_start || null,
+        scheduled_end: endISO || it.scheduled_end || null
+      } : it))
+      fetchSuggestions()
+      try { showToast({ title: 'Attached', description: 'Task attached to transaction' }) } catch {}
+    } catch (e) {
+      try { showToast({ title: 'Attach failed', description: e.message || 'Could not attach task', variant: 'destructive' }) } catch {}
+    }
+  }
+
   const completeTask = async (itemId, opts = {}) => {
     try {
       const res = await fetch(apiUrl(`/api/checklist/${itemId}`), {
@@ -291,7 +471,11 @@ export function AssistantPanel() {
       if (!res.ok) throw new Error('Failed to complete task')
       if (!opts.silent) fetchSuggestions()
     } catch (e) {
-      alert(e.message)
+      if (opts && opts.silent) {
+        throw e
+      } else {
+        alert(e.message)
+      }
     }
   }
 
@@ -300,7 +484,7 @@ export function AssistantPanel() {
       const res = await fetch(apiUrl(`/api/alerts/dismiss/${alertId}`), { method: 'POST' })
       if (!res.ok) throw new Error('Failed to dismiss alert')
       if (!opts.silent) fetchSuggestions()
-    } catch (e) { alert(e.message) }
+    } catch (e) { if (opts && opts.silent) { throw e } else { alert(e.message) } }
   }
 
   const openLeadDetails = async (leadOrId) => {
@@ -411,16 +595,53 @@ export function AssistantPanel() {
     return txn || 'Client/Listing'
   }
 
-  const openPlanDialog = () => {
+  const openPlanDialog = async () => {
+    // Ensure we have fresh suggestions so attached tasks & schedules show up
+    await fetchSuggestions()
+    // Start with computed items from refreshed data
     const items = getNBAItems()
     setProposedPlan(items)
     setSelectedPlanKeys(new Set(items.map(i => i.key)))
     setPlanResults([])
-    setPlanMeta(null)
+    // Create a sane default window so UI doesn't show "Invalid Date"
+    const now = new Date()
+    const defaultStart = new Date(now)
+    const defaultEnd = new Date(now); defaultEnd.setHours(now.getHours() + 8, 0, 0, 0)
+    setPlanMeta({ started_at: defaultStart.toISOString(), ends_at: defaultEnd.toISOString(), date: defaultStart.toISOString().slice(0,10) })
     setPlanContext(null)
     setGuidedActive(false)
     setGuidedIndex(0)
     setPlanOpen(true)
+
+    // Load latest saved plan and merge to persist custom tasks
+    try {
+      const qs = new URLSearchParams()
+      if (agent) qs.set('agent', agent)
+      const res = await fetch(apiUrl(`/api/assistant/plan/latest?${qs.toString()}`))
+      const json = await res.json().catch(() => ({}))
+      if (res.ok && json?.success && json.plan?.items?.length) {
+        setProposedPlan(prev => {
+          const existing = new Set(prev.map(i => i.key))
+          const merged = [...prev]
+          for (const it of json.plan.items) {
+            if (!existing.has(it.key)) merged.push(it)
+          }
+          return merged
+        })
+        setSelectedPlanKeys(new Set((json.plan.items || []).map(i => i.key)))
+        if (json.plan.plan) setPlanMeta(json.plan.plan)
+      }
+    } catch (_) { /* non-fatal */ }
+
+    // Fetch transactions for attach menu
+    try {
+      const res = await fetch(apiUrl('/api/transactions'))
+      const json = await res.json().catch(() => ({}))
+      if (res.ok && Array.isArray(json?.transactions || json)) {
+        const list = (json.transactions || json).map(t => ({ id: t.id, title: t.title || t.property_address || 'Transaction', client: t.client_name || t.clientFullName || '', type: (t.transaction_type || 'sale').toLowerCase(), stage: t.current_stage || null }))
+        setTxList(list)
+      }
+    } catch (_) { setTxList([]) }
   }
 
   const openPlanWithItems = (items) => {
@@ -462,7 +683,7 @@ export function AssistantPanel() {
       setPlanContext(opts.context || null)
       setGuidedActive(false)
       setGuidedIndex(0)
-      setPlanOpen(true)
+      if (opts.open_modal !== false) setPlanOpen(true)
     } catch (e) {
       alert(e.message || 'Failed to create plan')
       // Fallback to local plan using selected keys
@@ -565,6 +786,45 @@ export function AssistantPanel() {
     const keys = getNBAItems().filter(i => nbaSelectedKeys.has(i.key)).map(i => i.key)
     if (keys.length === 0) return
     await requestPlan(keys, { roll_to_next_workday: true, context: 'schedule' })
+  }
+
+  // One-click: Plan My Day — auto-schedule the day's Next Best Actions 9–5
+  const planMyDay = async () => {
+    try {
+      try { showToast({ title: 'Planning your day…', description: 'Generating an optimized schedule for 9–5' }) } catch {}
+      const todayKey = new Date().toISOString().slice(0,10)
+      const start = new Date(`${todayKey}T09:00:00`)
+      // Open dialog immediately in Grid view with default window
+      setPlanContext('schedule')
+      setPlanView('grid')
+      const endsAt = new Date(new Date(start).setHours(17,0,0,0))
+      setPlanMeta({ started_at: start.toISOString(), ends_at: endsAt.toISOString(), date: todayKey })
+      // Build a provisional local plan so the user sees something instantly
+      const base = getNBAItems().slice(0, 10)
+      let cursor = new Date(start)
+      const bufferMin = 10
+      const localPlan = base.map((it) => {
+        const dur = Math.max(25, Number(it.est_duration_min || 25))
+        const s = new Date(cursor)
+        let e = new Date(s.getTime() + dur * 60000)
+        if (e > endsAt) e = new Date(endsAt)
+        cursor = new Date(Math.min(endsAt.getTime(), e.getTime() + bufferMin * 60000))
+        return { ...it, scheduled_start: s.toISOString(), scheduled_end: e.toISOString() }
+      })
+      setProposedPlan(localPlan)
+      setInlinePlan(true)
+      await requestPlan(new Set(), {
+        start_time: start.toISOString(),
+        workday_start_hour: 9,
+        workday_end_hour: 17,
+        roll_to_next_workday: true,
+        context: 'schedule',
+        open_modal: false
+      })
+      try { showToast({ title: 'Plan ready', description: 'Review and edit your schedule' }) } catch {}
+    } catch (e) {
+      try { showToast({ title: 'Failed to plan day', description: e.message || 'Unexpected error', variant: 'destructive' }) } catch { alert(e.message || 'Failed to plan day') }
+    }
   }
 
   // Save plan to backend
@@ -780,10 +1040,12 @@ export function AssistantPanel() {
                 {summary.new_leads ? ` • ${summary.new_leads} new leads` : ''}
               </p>
             </div>
-            <Button size="sm" onClick={openPlanDialog} className="gap-1">
-              <Sparkles className="h-4 w-4" />
-              View Summary
-            </Button>
+            <Link href="/plan">
+              <Button size="sm" className="gap-1">
+                <Sparkles className="h-4 w-4" />
+                View Summary
+              </Button>
+            </Link>
           </CardContent>
         </Card>
       )}
@@ -797,7 +1059,7 @@ export function AssistantPanel() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={openPlanDialog} className="gap-2">
+          <Button size="sm" className="gap-2" onClick={planMyDay}>
             <Sparkles className="h-4 w-4" />
             Plan My Day
           </Button>
@@ -852,92 +1114,155 @@ export function AssistantPanel() {
         <div className="text-sm text-red-600">{error}</div>
       )}
 
-      {/* Greeting banner */}
-      <div className="flex items-start gap-3 p-3 rounded-md bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-900">
-        <Sparkles className="h-4 w-4 mt-0.5 text-purple-600" />
-        <div className="text-sm">
-          <div className="font-medium">{getGreeting()}!</div>
-          <div className="text-muted-foreground mt-0.5">
-            {`You have ${summary.overdue_tasks ?? 0} overdue and ${summary.due_today ?? 0} due today. Need a quick plan?`}
-          </div>
-        </div>
-      </div>
+      {/* Greeting banner removed to avoid duplication with top-of-page greeting */}
 
-      {/* Next Best Actions */}
-      <Card>
-        <CardHeader className="pb-2">
-          <SectionHeader icon={Sparkles} title="Next Best Actions" count={getNBAItems().length}
-            right={
-              <div className="flex items-center gap-2">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button size="sm" className="gap-1">Run</Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuLabel>Selected</DropdownMenuLabel>
-                    <DropdownMenuItem onClick={batchCompleteSelected}>Batch Complete</DropdownMenuItem>
-                    <DropdownMenuItem onClick={guidedRunSelected}>Guided Run…</DropdownMenuItem>
-                    <DropdownMenuItem onClick={scheduleSelected}>Schedule…</DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuLabel>Quick</DropdownMenuLabel>
-                    <DropdownMenuItem onClick={runQuickBatch}>Run Top</DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
+      {/* Next Best Actions OR Inline Plan */}
+      {inlinePlan ? (
+        <Card>
+          <CardHeader className="pb-2">
+            <SectionHeader
+              icon={Sparkles}
+              title="Today's Plan"
+              count={proposedPlan?.length || 0}
+              right={
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant={planView === 'list' ? 'default' : 'outline'} onClick={() => setPlanView('list')}>List</Button>
+                  <Button size="sm" variant={planView === 'grid' ? 'default' : 'outline'} onClick={() => setPlanView('grid')}>Grid</Button>
+                  <Button size="sm" onClick={handleSavePlan} disabled={!proposedPlan || proposedPlan.length === 0}>Save</Button>
+                  <Button size="sm" variant="outline" onClick={() => setInlinePlan(false)}>Back to Actions</Button>
+                </div>
+              }
+            />
+            <div className="text-xs text-muted-foreground">{formatPlanWindow(planMeta)}</div>
+          </CardHeader>
+          <CardContent>
+            {planView === 'grid' ? (
+              <div className="max-h-[70vh] overflow-auto">
+                <PlanDayGrid
+                  items={(proposedPlan || []).map((it) => ({
+                    key: it.key,
+                    id: it.id,
+                    type: it.type,
+                    label: it.label,
+                    client_name: it.client_name,
+                    property_address: it.property_address,
+                    scheduled_start: it.scheduled_start || null,
+                    scheduled_end: it.scheduled_end || null,
+                    est_duration_min: it.est_duration_min || 30
+                  }))}
+                  planMeta={planMeta || { started_at: new Date().toISOString(), ends_at: new Date(new Date().getTime() + 8*3600000).toISOString() }}
+                  workdayStartHour={9}
+                  workdayEndHour={17}
+                  onEditTime={onEditPlanTime}
+                />
               </div>
-            }
-          />
-        </CardHeader>
-        <CardContent>
-          <div className={sectionBox.base}>
-            {getNBAItems().length === 0 && (
-              <div className="text-sm text-muted-foreground">No urgent actions right now.</div>
+            ) : (
+              <div className="space-y-2 max-h-[70vh] overflow-auto">
+                {(proposedPlan || []).map((it) => (
+                  <div key={it.key} className="flex items-start justify-between border rounded p-2 bg-muted/30">
+                    <div>
+                      <div className="font-medium text-sm">{it.label}</div>
+                      {(it.client_name || it.property_address) && (
+                        <div className="text-[11px] text-muted-foreground">
+                          {it.client_name && it.property_address ? `${it.client_name} • ${it.property_address}` : (it.client_name || it.property_address)}
+                        </div>
+                      )}
+                      <div className="text-xs text-muted-foreground">
+                        {it.scheduled_start && it.scheduled_end
+                          ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}–${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                          : 'unscheduled'}
+                      </div>
+                    </div>
+                    <Checkbox
+                      checked={selectedPlanKeys.has(it.key)}
+                      onCheckedChange={() => toggleSelectPlanItem(it.key)}
+                    />
+                  </div>
+                ))}
+                {(!proposedPlan || proposedPlan.length === 0) && (
+                  <div className="text-sm text-muted-foreground">No plan items.</div>
+                )}
+              </div>
             )}
-            {getNBAItems().map((item) => (
-              <div key={item.key} className={`${sectionBox.item} mb-2 last:mb-0`}>
-                <div className="flex items-start gap-3 pr-3">
-                  <Checkbox
-                    id={`nba-${item.key}`}
-                    checked={nbaSelectedKeys.has(item.key)}
-                    onCheckedChange={() => setNbaSelectedKeys(prev => {
-                      const next = new Set(prev)
-                      if (next.has(item.key)) next.delete(item.key)
-                      else next.add(item.key)
-                      return next
-                    })}
-                    className="mt-0.5"
-                  />
-                  <div>
-                    <div className="font-medium text-sm flex items-center gap-2">
-                      <span>{item.label}</span>
-                      {typeof item.priority_score === 'number' && (
-                        <Badge variant="outline">Score {Math.round(item.priority_score)}</Badge>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader className="pb-2">
+            <SectionHeader icon={Sparkles} title="Next Best Actions" count={getNBAItems().length}
+              right={
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" className="gap-1" onClick={planMyDay}>Plan my day</Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button size="sm" className="gap-1">Run</Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuLabel>Selected</DropdownMenuLabel>
+                      <DropdownMenuItem onClick={batchCompleteSelected}>Batch Complete</DropdownMenuItem>
+                      <DropdownMenuItem onClick={guidedRunSelected}>Guided Run…</DropdownMenuItem>
+                      <DropdownMenuItem onClick={scheduleSelected}>Schedule…</DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel>Quick</DropdownMenuLabel>
+                      <DropdownMenuItem onClick={runQuickBatch}>Run Top</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              }
+            />
+          </CardHeader>
+          <CardContent>
+            <div className={sectionBox.base}>
+              {getNBAItems().length === 0 && (
+                <div className="text-sm text-muted-foreground">No urgent actions right now.</div>
+              )}
+              {getNBAItems().map((item) => (
+                <div key={item.key} className={`${sectionBox.item} mb-2 last:mb-0`}>
+                  <div className="flex items-start gap-3 pr-3">
+                    <Checkbox
+                      id={`nba-${item.key}`}
+                      checked={nbaSelectedKeys.has(item.key)}
+                      onCheckedChange={() => setNbaSelectedKeys(prev => {
+                        const next = new Set(prev)
+                        if (next.has(item.key)) next.delete(item.key)
+                        else next.add(item.key)
+                        return next
+                      })}
+                      className="mt-0.5"
+                    />
+                    <div>
+                      <div className="font-medium text-sm flex items-center gap-2">
+                        <span>{item.label}</span>
+                        {typeof item.priority_score === 'number' && (
+                          <Badge variant="outline">Score {Math.round(item.priority_score)}</Badge>
+                        )}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {(item.type === 'task' ? getTaskTransactionLabel(item.id) : 'Alert') || 'Client/Listing'}
+                        {item.est_duration_min ? ` • ~${item.est_duration_min} min` : ''}
+                      </div>
+                      {item.reason && (
+                        <div className="text-xs text-muted-foreground mt-0.5">{item.reason}</div>
                       )}
                     </div>
-                    <div className="text-xs text-muted-foreground">
-                      {(item.type === 'task' ? getTaskTransactionLabel(item.id) : 'Alert') || 'Client/Listing'}
-                      {item.est_duration_min ? ` • ~${item.est_duration_min} min` : ''}
-                    </div>
-                    {item.reason && (
-                      <div className="text-xs text-muted-foreground mt-0.5">{item.reason}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {item.type === 'task' ? (
+                      <Button size="sm" variant="outline" onClick={() => completeTask(item.id)}>
+                        <Check className="h-4 w-4" />
+                      </Button>
+                    ) : (
+                      <Button size="sm" variant="outline" onClick={() => dismissAlert(item.id)}>
+                        <X className="h-4 w-4" />
+                      </Button>
                     )}
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  {item.type === 'task' ? (
-                    <Button size="sm" variant="outline" onClick={() => completeTask(item.id)}>
-                      <Check className="h-4 w-4" />
-                    </Button>
-                  ) : (
-                    <Button size="sm" variant="outline" onClick={() => dismissAlert(item.id)}>
-                      <X className="h-4 w-4" />
-                    </Button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Summary tiles */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-3">
@@ -1196,118 +1521,67 @@ export function AssistantPanel() {
 
       <div className="text-xs text-muted-foreground">Updated {data?.generated_at ? new Date(data.generated_at).toLocaleString() : '—'}</div>
 
-      {/* Plan My Day Dialog */}
+      {/* Plan Dialog */}
       <Dialog open={planOpen} onOpenChange={setPlanOpen}>
-        <DialogContent className="max-w-3xl w-[min(100vw-2rem,900px)]">
+        <DialogContent className="max-w-3xl">
           <DialogHeader>
-            <DialogTitle>
-              Plan
-              {planMeta ? ` • ${formatPlanWindow(planMeta)}` : ''}
-            </DialogTitle>
-            <DialogDescription>
-              {planContext === 'guided' && 'Guided Run window. Step through each action below.'}
-              {planContext === 'schedule' && 'Scheduled within your work hours. You can save or export this plan.'}
-              {!planContext && 'Select actions and let me handle them.'}
-            </DialogDescription>
+            <DialogTitle>Today's Plan</DialogTitle>
+            <DialogDescription>{formatPlanWindow(planMeta) || 'Arrange your day'}</DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="text-xs text-muted-foreground">View</div>
-              <ToggleGroup type="single" value={planView} onValueChange={(v) => v && setPlanView(v)}>
-                <ToggleGroupItem value="list" aria-label="List view">List</ToggleGroupItem>
-                <ToggleGroupItem value="grid" aria-label="Grid view">Grid</ToggleGroupItem>
-              </ToggleGroup>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-muted-foreground">{proposedPlan?.length || 0} items</div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant={planView === 'list' ? 'default' : 'outline'} onClick={() => setPlanView('list')}>List</Button>
+              <Button size="sm" variant={planView === 'grid' ? 'default' : 'outline'} onClick={() => setPlanView('grid')}>Grid</Button>
+              <Button size="sm" onClick={handleSavePlan} disabled={!proposedPlan || proposedPlan.length === 0}>Save</Button>
             </div>
-            {proposedPlan.length === 0 && (
-              <div className="text-sm text-muted-foreground">Nothing urgent right now. You’re all set!</div>
-            )}
-            {planView === 'grid' ? (
-              <div className="max-h-[60vh] overflow-auto pr-1">
-                <PlanDayGrid
-                  items={proposedPlan}
-                  planMeta={planMeta}
-                  onEditTime={onEditPlanTime}
-                  onAddTask={onAddPlanTask}
-                />
-              </div>
-            ) : (
-              <ScrollArea className="max-h-80 pr-2">
-                <div className="space-y-2">
-                  {proposedPlan.map(item => (
-                    <label key={item.key} className="flex items-start gap-3 p-3 rounded-md border bg-background hover:bg-muted/40 transition">
-                      <Checkbox
-                        id={`plan-${item.key}`}
-                        checked={selectedPlanKeys.has(item.key)}
-                        onCheckedChange={() => toggleSelectPlanItem(item.key)}
-                        className="mt-0.5"
-                      />
-                      <div className="text-sm">
-                        <div className="font-medium">{item.label}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {(item.type === 'task' ? getTaskTransactionLabel(item.id) : 'Alert') || 'Client/Listing'}
-                          {item.est_duration_min ? ` • ~${item.est_duration_min} min` : ''}
-                        </div>
-                        {(item.scheduled_start && item.scheduled_end) && (
-                          <div className="text-xs text-muted-foreground">Scheduled: {formatTime(item.scheduled_start)}–{formatTime(item.scheduled_end)}</div>
-                        )}
+          </div>
+          {planView === 'grid' ? (
+            <div className="max-h-[70vh] overflow-auto">
+              <PlanDayGrid
+                items={(proposedPlan || []).map((it) => ({
+                  key: it.key,
+                  id: it.id,
+                  type: it.type,
+                  label: it.label,
+                  scheduled_start: it.scheduled_start || null,
+                  scheduled_end: it.scheduled_end || null,
+                  est_duration_min: it.est_duration_min || 30
+                }))}
+                planMeta={planMeta || { started_at: new Date().toISOString(), ends_at: new Date(new Date().getTime() + 8*3600000).toISOString() }}
+                workdayStartHour={9}
+                workdayEndHour={17}
+                onEditTime={onEditPlanTime}
+              />
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[70vh] overflow-auto">
+              {(proposedPlan || []).map((it) => (
+                <div key={it.key} className="flex items-start justify-between border rounded p-2 bg-muted/30">
+                  <div>
+                    <div className="font-medium text-sm">{it.label}</div>
+                    {(it.client_name || it.property_address) && (
+                      <div className="text-[11px] text-muted-foreground">
+                        {it.client_name || it.property_address}
                       </div>
-                    </label>
-                  ))}
-                </div>
-              </ScrollArea>
-            )}
-
-            {guidedActive && (
-              <div className="p-3 rounded-md bg-muted">
-                <div className="text-xs font-medium mb-2">Guided Run</div>
-                {(() => {
-                  const list = getSelectedPlanList()
-                  const item = list[guidedIndex]
-                  if (!item) return <div className="text-sm">All done.</div>
-                  return (
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium">{item.label}</div>
-                      <div className="text-xs text-muted-foreground">
-                        {item.scheduled_start ? `${formatTime(item.scheduled_start)}–${formatTime(item.scheduled_end)} • ` : ''}
-                        {item.est_duration_min ? `~${item.est_duration_min} min` : ''}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Button size="sm" onClick={completeCurrentGuided}>Complete</Button>
-                        <Button size="sm" variant="outline" onClick={skipCurrentGuided}>Skip</Button>
-                        <Button size="sm" variant="ghost" onClick={advanceGuided}>Next</Button>
-                      </div>
+                    )}
+                    <div className="text-xs text-muted-foreground">
+                      {it.scheduled_start && it.scheduled_end
+                        ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}–${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                        : 'unscheduled'}
                     </div>
-                  )
-                })()}
-              </div>
-            )}
-
-            {planResults.length > 0 && (
-              <div className="p-2 rounded-md bg-muted">
-                <div className="text-xs font-medium mb-1">Results</div>
-                <ul className="text-xs space-y-1">
-                  {planResults.map(r => (
-                    <li key={r.key} className={r.status === 'ok' ? 'text-green-700 dark:text-green-400' : r.status === 'skipped' ? 'text-muted-foreground' : 'text-red-600'}>
-                      {r.status === 'ok' ? '✓' : r.status === 'skipped' ? '↷' : '✗'} {proposedPlan.find(i => i.key === r.key)?.label} — {r.message}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-          <div className="mt-4 flex items-center justify-between gap-2 border-t pt-3">
-            <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" onClick={handleSavePlan} disabled={!proposedPlan.length}>Save</Button>
-              <Button size="sm" variant="outline" onClick={handleExportICS} disabled={!proposedPlan.some(i => i.scheduled_start)}>Export .ics</Button>
+                  </div>
+                  <Checkbox
+                    checked={selectedPlanKeys.has(it.key)}
+                    onCheckedChange={() => toggleSelectPlanItem(it.key)}
+                  />
+                </div>
+              ))}
+              {(!proposedPlan || proposedPlan.length === 0) && (
+                <div className="text-sm text-muted-foreground">No plan items.</div>
+              )}
             </div>
-            <div className="flex items-center gap-2">
-              <Button size="sm" variant="secondary" onClick={startGuidedRun} disabled={guidedActive || selectedPlanKeys.size === 0}>Start Guided Run</Button>
-              <Button size="sm" variant="outline" onClick={() => setPlanOpen(false)} disabled={runningPlan}>Close</Button>
-              <Button size="sm" onClick={runPlan} disabled={runningPlan || proposedPlan.length === 0 || selectedPlanKeys.size === 0}>
-                {runningPlan ? 'Running…' : 'Run Selected'}
-              </Button>
-            </div>
-          </div>
+          )}
         </DialogContent>
       </Dialog>
 

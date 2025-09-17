@@ -40,13 +40,11 @@ export function PlanDayGrid({
   }, [workdayEndHour, planMeta])
 
   const hours = Math.max(1, wdEndHour - wdStartHour)
-  const hourHeight = 56 // px per hour
+  const hourHeight = 64 // px per hour (more breathing room)
   const pxPerMin = hourHeight / 60
   const labelWidth = 80
 
-  const [addTitle, setAddTitle] = useState("")
-  const [addStart, setAddStart] = useState(() => `${String(Math.max(0, wdStartHour)).padStart(2, '0')}:00`)
-  const [addDur, setAddDur] = useState("30")
+  // Removed inline Add Task UI; scheduling/editing for existing items remains
 
   const timeLabel = (h) => {
     try {
@@ -97,40 +95,6 @@ export function PlanDayGrid({
 
   return (
     <div className="space-y-3">
-      {/* Toolbar */}
-      <div className="flex items-center justify-end">
-        <Popover>
-          <PopoverTrigger asChild>
-            <Button size="sm" variant="outline">Add Task</Button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="w-80">
-            <div className="space-y-2">
-              <div className="text-sm font-medium">New task</div>
-              <div className="grid grid-cols-3 gap-2 items-center">
-                <label className="col-span-1 text-xs text-muted-foreground">Title</label>
-                <Input className="col-span-2" value={addTitle} onChange={(e) => setAddTitle(e.target.value)} placeholder="Task title" />
-                <label className="col-span-1 text-xs text-muted-foreground">Start</label>
-                <Input className="col-span-2" type="time" value={addStart} onChange={(e) => setAddStart(e.target.value)} />
-                <label className="col-span-1 text-xs text-muted-foreground">Duration</label>
-                <div className="col-span-2 flex items-center gap-2">
-                  <Input type="number" min="5" step="5" value={addDur} onChange={(e) => setAddDur(e.target.value)} className="w-20" />
-                  <span className="text-xs text-muted-foreground">min</span>
-                </div>
-              </div>
-              <div className="flex justify-end gap-2">
-                <Button size="sm" onClick={() => {
-                  const startISO = toISOAtDate(dayRef, addStart)
-                  const dur = Math.max(5, Number(addDur) || 30)
-                  const end = new Date(startISO)
-                  end.setMinutes(end.getMinutes() + dur)
-                  onAddTask && onAddTask({ title: addTitle || 'Custom Task', startISO, endISO: end.toISOString(), duration: dur })
-                  setAddTitle("")
-                }}>Add</Button>
-              </div>
-            </div>
-          </PopoverContent>
-        </Popover>
-      </div>
 
       <div className="relative border rounded-md" style={{ paddingBottom: hourHeight }}>
         {/* Time labels column */}
@@ -151,18 +115,24 @@ export function PlanDayGrid({
             const startMin = toMinutesFromStart(clampToGrid(it.scheduled_start))
             const endMin = toMinutesFromStart(clampToGrid(it.scheduled_end))
             const top = Math.max(0, startMin * pxPerMin)
-            const height = Math.max(24, (endMin - startMin) * pxPerMin)
+            const height = Math.max(32, (endMin - startMin) * pxPerMin)
             return (
               <Popover key={it.key}>
                 <PopoverTrigger asChild>
                   <div className="absolute left-2 right-2 rounded-md bg-primary/10 hover:bg-primary/20 border border-primary/30 cursor-pointer" style={{ top, height, padding: 8 }}>
                     <div className="text-xs font-medium truncate">{it.label}</div>
+                    {(it.client_name || it.property_address) && (
+                      <div className="text-[10px] text-muted-foreground truncate">{it.client_name || it.property_address}</div>
+                    )}
                     <div className="text-[10px] text-muted-foreground">{fmtHM(it.scheduled_start)} – {fmtHM(it.scheduled_end)}</div>
                   </div>
                 </PopoverTrigger>
                 <PopoverContent align="start" className="w-80">
                   <div className="space-y-2">
                     <div className="text-sm font-medium">Edit time</div>
+                    {(it.client_name || it.property_address) && (
+                      <div className="text-xs text-muted-foreground">{it.client_name || it.property_address}</div>
+                    )}
                     <div className="grid grid-cols-2 gap-2 items-center">
                       <label className="text-xs text-muted-foreground">Start</label>
                       <Input type="time" defaultValue={fmtHM(it.scheduled_start)} onChange={(e) => {
@@ -207,7 +177,12 @@ export function PlanDayGrid({
           <div className="space-y-1">
             {unscheduled.map((it) => (
               <div key={it.key} className="flex items-center justify-between text-xs text-muted-foreground">
-                <div className="truncate pr-2">{it.label}{it.est_duration_min ? ` • ~${it.est_duration_min} min` : ''}</div>
+                <div className="truncate pr-2">
+                  <div className="truncate">{it.label}{it.est_duration_min ? ` • ~${it.est_duration_min} min` : ''}</div>
+                  {(it.client_name || it.property_address) && (
+                    <div className="text-[10px] text-muted-foreground truncate">{it.client_name || it.property_address}</div>
+                  )}
+                </div>
                 <Popover>
                   <PopoverTrigger asChild>
                     <Button size="sm" variant="outline">Schedule</Button>

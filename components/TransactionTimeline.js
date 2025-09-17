@@ -168,6 +168,28 @@ export function TransactionTimeline({ transactionId }) {
     }
   }, [editingItem])
 
+  // Live sync: refresh checklist when tasks are changed elsewhere (PMD or other tabs)
+  useEffect(() => {
+    if (!transactionId) return
+    let es
+    let t = null
+    const schedule = () => {
+      if (t) clearTimeout(t)
+      t = setTimeout(() => { fetchChecklist() }, 250)
+    }
+    try {
+      es = new EventSource('/api/assistant/stream')
+      es.addEventListener('ready', schedule)
+      es.addEventListener('tasks:changed', schedule)
+      es.addEventListener('suggestions:update', schedule)
+      es.onerror = () => { try { es.close() } catch {} }
+    } catch (_) { /* ignore SSE errors */ }
+    return () => {
+      if (t) clearTimeout(t)
+      try { es && es.close() } catch {}
+    }
+  }, [transactionId])
+
   const fetchTransaction = async () => {
     try {
       const response = await fetch(`/api/transactions/${transactionId}`)

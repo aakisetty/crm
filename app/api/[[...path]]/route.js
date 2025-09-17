@@ -3897,6 +3897,15 @@ async function handleRoute(request, { params }) {
         }
 
         const { _id, ...cleanedItem } = item
+        // SSE broadcast so clients refresh lists
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('tasks:changed', { action: 'created', id: item.id, transaction_id: transactionId })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'task_created', id: item.id })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
         return handleCORS(NextResponse.json({ success: true, checklist_item: cleanedItem }, { status: 201 }))
       } catch (error) {
         console.error('Error creating checklist item:', error)
@@ -4001,6 +4010,16 @@ async function handleRoute(request, { params }) {
         const updatedItem = await db.collection('checklist_items').findOne({ id: itemId })
         const { _id, ...cleanedItem } = updatedItem
         
+        // SSE broadcast to notify clients about checklist updates
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('tasks:changed', { action: 'updated', id: itemId, fields: Object.keys(updateData || {}) })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'task_updated', id: itemId })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
+
         return handleCORS(NextResponse.json({
           success: true,
           checklist_item: cleanedItem
@@ -4027,6 +4046,16 @@ async function handleRoute(request, { params }) {
             error: "Checklist item not found"
           }, { status: 404 }))
         }
+
+        // SSE broadcast so clients refresh lists
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('tasks:changed', { action: 'deleted', id: itemId })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'task_deleted', id: itemId })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
 
         return handleCORS(NextResponse.json({
           message: "Checklist item deleted successfully"
@@ -4145,6 +4174,175 @@ async function handleRoute(request, { params }) {
       } catch (error) {
         console.error('Error deleting voice memo:', error)
         return handleCORS(NextResponse.json({ success: false, error: 'Failed to delete voice memo' }, { status: 500 }))
+      }
+    }
+
+    // =============================
+    // PMD (Plan My Day) ENDPOINTS
+    // =============================
+    // GET /api/pmd/tasks?date=YYYY-MM-DD[&agent=]
+    if (route === '/pmd/tasks' && method === 'GET') {
+      try {
+        const url = new URL(request.url)
+        const dateStr = url.searchParams.get('date') || new Date().toISOString().slice(0,10)
+        const agent = url.searchParams.get('agent')
+        // Use server-local time for start/end of day to avoid UTC drift
+        const startOfDay = new Date(`${dateStr}T00:00:00`)
+        const endOfDay = new Date(`${dateStr}T23:59:59.999`)
+        const now = new Date()
+
+        const agentFilter = agent ? { assignee: agent } : {}
+
+        // Fetch candidate sets
+        const [overdue, todayTasks, upcoming] = await Promise.all([
+          db.collection('checklist_items').find({ status: { $ne: 'completed' }, due_date: { $lt: startOfDay }, ...agentFilter }).toArray(),
+          db.collection('checklist_items').find({ status: { $ne: 'completed' }, due_date: { $gte: startOfDay, $lte: endOfDay }, ...agentFilter }).toArray(),
+          db.collection('checklist_items').find({ status: { $ne: 'completed' }, due_date: { $gt: endOfDay }, ...agentFilter }).sort({ due_date: 1 }).limit(200).toArray()
+        ])
+
+        const all = [...overdue, ...todayTasks, ...upcoming]
+
+        // Hydrate basic client/listing fields from transactions
+        const txIds = [...new Set(all.map(t => t.transaction_id).filter(Boolean))]
+        const txMap = new Map()
+        if (txIds.length) {
+          const txs = await db.collection('transactions').find({ id: { $in: txIds } }).toArray()
+          for (const tx of txs) txMap.set(tx.id, tx)
+        }
+
+        // Compute ai_score and filter dismissed for this date (post-filter for stub safety)
+        const dateKey = dateStr
+        const score = (it) => {
+          let s = 0
+          const due = it.due_date ? new Date(it.due_date) : null
+          const daysToDue = due ? Math.ceil((due - now) / 86400000) : null
+          if (daysToDue == null) s -= 2
+          else if (daysToDue < 0) s += 10 + Math.min(5, Math.abs(daysToDue))
+          else if (daysToDue === 0) s += 8
+          else if (daysToDue <= 3) s += 5
+          if (it.priority === 'urgent') s += 6
+          else if (it.priority === 'high') s += 3
+          s += (Number(it.est_duration_min || 0) <= 30 ? 2 : 0)
+          return s
+        }
+
+        const cleaned = all
+          .filter(t => !Array.isArray(t.dismissed_dates) || !t.dismissed_dates.includes(dateKey))
+          .map(({ _id, ...t }) => ({
+            ...t,
+            client_name: t.client_name || txMap.get(t.transaction_id)?.client_name || null,
+            property_address: t.property_address || txMap.get(t.transaction_id)?.property_address || null,
+            ai_score: score(t)
+          }))
+          .sort((a, b) => b.ai_score - a.ai_score)
+
+        return handleCORS(NextResponse.json({ success: true, tasks: cleaned }))
+      } catch (error) {
+        console.error('PMD tasks error', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to fetch PMD tasks' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/pmd/plans - Save snapshot of today's selected tasks
+    if (route === '/pmd/plans' && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const date = body.date || new Date().toISOString().slice(0,10)
+        const agent = body.agent || null
+        const items = Array.isArray(body.items) ? body.items : []
+        const doc = {
+          id: uuidv4(),
+          date,
+          agent,
+          items,
+          created_at: new Date(),
+          updated_at: new Date()
+        }
+        await db.collection('pmd_plans').insertOne(doc)
+        const { _id, ...cleaned } = doc
+        return handleCORS(NextResponse.json({ success: true, plan: cleaned }, { status: 201 }))
+      } catch (error) {
+        console.error('PMD save error', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to save plan' }, { status: 500 }))
+      }
+    }
+
+    // GET /api/pmd/plans/latest?date=YYYY-MM-DD[&agent=]
+    if (route === '/pmd/plans/latest' && method === 'GET') {
+      try {
+        const url = new URL(request.url)
+        const date = url.searchParams.get('date') || new Date().toISOString().slice(0,10)
+        const agent = url.searchParams.get('agent')
+        const query = { date }
+        if (agent) query.agent = agent
+        const plan = await db.collection('pmd_plans').find(query).sort({ created_at: -1 }).limit(1).toArray()
+        if (!plan || plan.length === 0) {
+          return handleCORS(NextResponse.json({ success: true, plan: null }))
+        }
+        const { _id, ...cleaned } = plan[0]
+        return handleCORS(NextResponse.json({ success: true, plan: cleaned }))
+      } catch (error) {
+        console.error('PMD latest error', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to load latest plan' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/tasks/:id/snooze { until }
+    if (route.match(/^\/tasks\/[^\/]+\/snooze$/) && method === 'POST') {
+      try {
+        const itemId = path[1]
+        const body = await request.json().catch(() => ({}))
+        const until = body.until ? new Date(body.until) : null
+        if (!until || isNaN(until)) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Invalid until' }, { status: 400 }))
+        }
+        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        if (!existing) return handleCORS(NextResponse.json({ success: false, error: 'Task not found' }, { status: 404 }))
+        await db.collection('checklist_items').updateOne({ id: itemId }, { $set: { due_date: until, updated_at: new Date() } })
+        const updated = await db.collection('checklist_items').findOne({ id: itemId })
+        const { _id, ...cleaned } = updated
+        // SSE broadcast to refresh panels
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('tasks:changed', { action: 'snoozed', id: itemId, until })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'task_snoozed', id: itemId })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
+        return handleCORS(NextResponse.json({ success: true, task: cleaned }))
+      } catch (error) {
+        console.error('Snooze error', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to snooze task' }, { status: 500 }))
+      }
+    }
+
+    // POST /api/tasks/:id/dismiss { date }
+    if (route.match(/^\/tasks\/[^\/]+\/dismiss$/) && method === 'POST') {
+      try {
+        const itemId = path[1]
+        const body = await request.json().catch(() => ({}))
+        const date = body.date || new Date().toISOString().slice(0,10)
+        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        if (!existing) return handleCORS(NextResponse.json({ success: false, error: 'Task not found' }, { status: 404 }))
+        const dismissed = Array.isArray(existing.dismissed_dates) ? existing.dismissed_dates : []
+        if (!dismissed.includes(date)) dismissed.push(date)
+        await db.collection('checklist_items').updateOne({ id: itemId }, { $set: { dismissed_dates: dismissed, updated_at: new Date() } })
+        const updated = await db.collection('checklist_items').findOne({ id: itemId })
+        const { _id, ...cleaned } = updated
+        // SSE broadcast so UI updates immediately
+        try {
+          const g = globalThis
+          if (g.__crmSSE?.clients) {
+            const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('tasks:changed', { action: 'dismissed', id: itemId, date })) } catch {} }
+            for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('suggestions:update', { reason: 'task_dismissed', id: itemId })) } catch {} }
+          }
+        } catch (_) { /* ignore SSE errors */ }
+        return handleCORS(NextResponse.json({ success: true, task: cleaned }))
+      } catch (error) {
+        console.error('Dismiss error', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to dismiss task' }, { status: 500 }))
       }
     }
 
@@ -4887,9 +5085,10 @@ async function handleRoute(request, { params }) {
           start_time = null,
           workday_start_hour = 9,
           workday_end_hour = 17,
-          buffer_min = 5,
+          buffer_min = 10,
           max_items = 10,
-          roll_to_next_workday = false
+          roll_to_next_workday = false,
+          min_block_min = 25
         } = body || {}
         const now = new Date()
         const db = await connectToMongo()
@@ -4978,7 +5177,7 @@ async function handleRoute(request, { params }) {
             })
           }
         } else {
-          // Fallback: derive tasks up to max_items
+          // Fallback: derive tasks up to max_items and hydrate with transaction info
           const endOfToday = new Date(now); endOfToday.setHours(23,59,59,999)
           const startOfToday = new Date(now); startOfToday.setHours(0,0,0,0)
           const tasks = await db.collection('checklist_items')
@@ -4986,20 +5185,32 @@ async function handleRoute(request, { params }) {
             .sort({ due_date: 1 })
             .limit(max_items)
             .toArray()
+
+          // Hydrate transactions for client/listing display
+          const txIds = [...new Set(tasks.map(t => t.transaction_id).filter(Boolean))]
+          const txMap = new Map()
+          if (txIds.length) {
+            const txList = await db.collection('transactions').find({ id: { $in: txIds } }).toArray()
+            for (const tx of txList) txMap.set(tx.id, tx)
+          }
+
           items = tasks.map(t => {
             const { est_duration_min, priority_score, urgency } = estimateTask(t)
             const due = t.due_date ? new Date(t.due_date) : null
             const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : '—'
+            const tx = txMap.get(t.transaction_id)
             return {
               key: `task:${t.id}`,
               type: 'task',
               id: t.id,
               label: `Complete: ${t.title || 'Task'} (${labelDue})`,
               transaction_id: t.transaction_id,
+              client_name: tx?.client_name || t.client_name,
+              property_address: tx?.property_address || t.property_address,
               est_duration_min,
               priority_score,
               urgency,
-              reason: t.client_name ? `Client: ${t.client_name}` : undefined
+              reason: (tx?.client_name || t.client_name) ? `Client: ${tx?.client_name || t.client_name}` : undefined
             }
           })
         }
@@ -5032,7 +5243,7 @@ async function handleRoute(request, { params }) {
         const scheduled = []
         const overflow = []
         for (const it of items) {
-          const dur = Math.max(1, Number(it.est_duration_min || 10))
+          const dur = Math.max(Number(min_block_min) || 25, Number(it.est_duration_min || min_block_min))
           const end = new Date(cursor.getTime() + dur * 60000)
           if (end <= workEnd) {
             scheduled.push({ ...it, scheduled_start: cursor.toISOString(), scheduled_end: end.toISOString() })
@@ -5093,6 +5304,26 @@ async function handleRoute(request, { params }) {
       } catch (error) {
         console.error('Assistant plan save error:', error)
         return handleCORS(NextResponse.json({ success: false, error: 'Failed to save plan' }, { status: 500 }))
+      }
+    }
+
+    // GET /api/assistant/plan/latest - Fetch latest saved plan (optionally by agent)
+    if (route === '/assistant/plan/latest' && method === 'GET') {
+      try {
+        const url = new URL(request.url)
+        const agentQ = url.searchParams.get('agent') || null
+        const db = await connectToMongo()
+        const query = agentQ ? { agent: agentQ } : {}
+        const latest = await db.collection('assistant_plans').find(query).sort({ created_at: -1 }).limit(1).toArray()
+        const doc = latest && latest[0] ? latest[0] : null
+        if (!doc) {
+          return handleCORS(NextResponse.json({ success: true, plan: null }))
+        }
+        const { _id, ...rest } = doc
+        return handleCORS(NextResponse.json({ success: true, plan: rest }))
+      } catch (error) {
+        console.error('Assistant latest plan error:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to load latest plan' }, { status: 500 }))
       }
     }
 
